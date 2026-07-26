@@ -18,9 +18,9 @@ set "CLANG_BIN=H:\clang+llvm-22.1.2-x86_64-pc-windows-msvc\bin"
 set "CC=%CLANG_BIN%\clang-cl.exe"
 set "CXX=%CLANG_BIN%\clang-cl.exe"
 set "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe"
-set "NASM_EXE=C:\Users\Incredible\AppData\Local\bin\NASM\nasm.exe"
+set "NASM_EXE=C:\Users\%USERNAME%\AppData\Local\bin\NASM\nasm.exe"
 if exist "%NASM_EXE%" (
-    set "PATH=%PATH%;C:\Users\Incredible\AppData\Local\bin\NASM"
+    set "PATH=%PATH%;C:\Users\%USERNAME%\AppData\Local\bin\NASM"
 )
 set "PERL_EXE=H:\strawberry-perl-5.42.2.1-64bit-portable\perl\bin\perl.exe"
 if exist "%PERL_EXE%" (

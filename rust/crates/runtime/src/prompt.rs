@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::config::{user_home_dir, ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
 
 /// Errors raised while assembling the final system prompt.
@@ -201,9 +201,17 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
 }
 
 fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+    let home_boundary = user_home_dir().and_then(|h| h.canonicalize().ok());
     let mut directories = Vec::new();
     let mut cursor = Some(cwd);
     while let Some(dir) = cursor {
+        if let Some(ref home) = home_boundary {
+            if let Ok(canon) = dir.canonicalize() {
+                if canon == *home {
+                    break;
+                }
+            }
+        }
         directories.push(dir.to_path_buf());
         cursor = dir.parent();
     }

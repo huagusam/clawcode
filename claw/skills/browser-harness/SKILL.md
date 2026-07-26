@@ -7,7 +7,7 @@ description: Use when automating browser interactions (open pages, click, type, 
 
 Operational guide for the `browser-harness` CLI tool covering web page browsing, screenshots, clicking, form filling, web scraping, remote cloud browsers, and anti-scraping content extraction.
 
-> `browser-harness` is already in PATH (`C:\Users\Incredible\.local\bin\browser-harness.exe`). Use directly — no installation check needed.
+> `browser-harness` is already in PATH (`C:\Users\%USERNAME%\.local\bin\browser-harness.exe`). Use directly — no installation check needed.
 
 ## When to Use
 

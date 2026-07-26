@@ -707,8 +707,8 @@ fn extract_permission_subject(input: &str, tool_name: &str) -> Option<String> {
         // Search tools
         "glob_search" | "grep_search" | "glob" | "grep" | "search" => "pattern",
         // Web tools
-        "WebFetch" | "WebFind" | "web_search" | "web_fetch" | "web" => "url",
-        "WebSearch" | "ToolSearch" => "query",
+        "WebFetch" | "WebFind" | "web_fetch" | "web" => "url",
+        "WebSearch" | "web_search" | "ToolSearch" => "query",
         // Messaging
         "SendUserMessage" | "ask" | "message" | "say" => "message",
 

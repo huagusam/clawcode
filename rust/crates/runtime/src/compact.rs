@@ -2,8 +2,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tiktoken_rs::CoreBPE;
 
+use crate::compression_config::CompressionConfig;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
-use crate::summary_compression::compress_summary_text;
+use crate::summary_compression::{compress_summary, compress_summary_text, SummaryCompressionBudget};
 
 /// Lazily initialized cl100k_base encoder. Returns `None` if tiktoken
 /// initialization fails — the system degrades gracefully to a byte-count
@@ -47,6 +48,9 @@ pub struct CompactionConfig {
     /// When 0 (default), turn-based preservation is disabled and only the
     /// token-budget and message-minimum dimensions apply.
     pub preserve_last_n_turns: usize,
+    /// Summary compression budget. When `None`, falls back to
+    /// `CompressionConfig::global()` summary settings.
+    pub summary_budget: Option<SummaryCompressionBudget>,
 }
 
 impl Default for CompactionConfig {
@@ -56,6 +60,19 @@ impl Default for CompactionConfig {
             preserve_recent_tokens: 2000,
             max_estimated_tokens: 10_000,
             preserve_last_n_turns: 0,
+            summary_budget: None,
+        }
+    }
+}
+
+impl CompactionConfig {
+    pub fn from_config(config: &CompressionConfig) -> Self {
+        Self {
+            preserve_recent_messages: config.compact_preserve_recent_messages,
+            preserve_recent_tokens: config.compact_preserve_recent_tokens,
+            max_estimated_tokens: config.compact_max_estimated_tokens,
+            preserve_last_n_turns: config.compact_preserve_last_n_turns,
+            summary_budget: Some(SummaryCompressionBudget::from_config(config)),
         }
     }
 }
@@ -295,7 +312,10 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     let preserved = session.messages[keep_from..].to_vec();
     let raw_summary =
         merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
-    let summary = compress_summary_text(&raw_summary);
+    let summary = match config.summary_budget {
+        Some(budget) => compress_summary(&raw_summary, budget).summary,
+        None => compress_summary_text(&raw_summary),
+    };
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -644,26 +664,36 @@ pub fn estimate_image_block_tokens(base64_data: &str) -> usize {
 
 /// Returns cached token count if available, otherwise computes it.
 /// Uses tiktoken cl100k_base when available, falls back to `bytes/4`.
-/// Image blocks use `bytes * 3/4 / 750 + 20` (Anthropic-style estimate on
-/// decoded byte length, NOT on base64 string length).
-fn estimate_message_tokens(message: &ConversationMessage) -> usize {
+/// Includes role overhead (4 system/user, 3 assistant, 5 tool) and block
+/// framing (3 per ToolUse/ToolResult) to stay consistent with the public
+/// [`context::estimate_message_tokens`] which delegates here.
+pub(crate) fn estimate_message_tokens(message: &ConversationMessage) -> usize {
     // Use cached value if already computed.
     if let Some(cached) = message.cached_tokens.get() {
         return *cached;
     }
 
-    let total: usize = message
+    let mut total: usize = match message.role {
+        MessageRole::System => 4,
+        MessageRole::User => 4,
+        MessageRole::Assistant => 3,
+        MessageRole::Tool => 5,
+    };
+
+    total += message
         .blocks
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => estimate_text_tokens(text),
             ContentBlock::ToolUse { name, input, .. } => {
                 let input_str = input.to_string();
-                estimate_text_tokens(name) + estimate_text_tokens(&input_str)
+                3 + estimate_text_tokens(name) + estimate_text_tokens(&input_str)
             }
             ContentBlock::ToolResult {
                 tool_name, output, ..
-            } => estimate_text_tokens(tool_name) + estimate_text_tokens(output),
+            } => {
+                3 + estimate_text_tokens(tool_name) + estimate_text_tokens(output)
+            }
             ContentBlock::Image { data, .. } => {
                 // Base64 is 33% inflated → decode bytes = len * 3/4.
                 // Anthropic-style image token estimate: bytes / 750 + 20.
@@ -676,7 +706,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
             }
             ContentBlock::Thinking { thinking, .. } => estimate_text_tokens(thinking),
         })
-        .sum();
+        .sum::<usize>();
 
     // Populate cache. This is a best-effort write; if another thread raced
     // here first, the value was already set and ours is discarded.
@@ -838,6 +868,7 @@ mod tests {
                 preserve_recent_tokens: 1,
                 max_estimated_tokens: 1,
                 preserve_last_n_turns: 0,
+                summary_budget: None,
             },
         );
 
@@ -866,6 +897,7 @@ mod tests {
                 preserve_recent_tokens: 1,
                 max_estimated_tokens: 1,
                 preserve_last_n_turns: 0,
+                summary_budget: None,
             }
         ));
         // Note: with the tool-use/tool-result boundary guard the compacted session
@@ -896,6 +928,7 @@ mod tests {
             preserve_recent_tokens: 1,
             max_estimated_tokens: 1,
             preserve_last_n_turns: 0,
+            summary_budget: None,
         };
 
         let first = compact_session(&initial_session, config);
@@ -963,6 +996,7 @@ mod tests {
                 preserve_recent_tokens: 1,
                 max_estimated_tokens: 1,
                 preserve_last_n_turns: 0,
+                summary_budget: None,
             }
         ));
     }
@@ -1190,6 +1224,7 @@ mod tests {
             preserve_recent_tokens: 1,
             max_estimated_tokens: 1,
             preserve_last_n_turns: 1,
+            summary_budget: None,
         };
         let result = compact_session(&session, config);
         // At minimum the last turn (2 messages: user+assistant) is kept.

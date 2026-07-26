@@ -92,11 +92,11 @@ echo         CC=CXX=%CC%
 
 echo [4/6] Checking optional tools...
 
-set "NASM_EXE=C:\Users\Incredible\AppData\Local\bin\NASM\nasm.exe"
+set "NASM_EXE=C:\Users\%USERNAME%\AppData\Local\bin\NASM\nasm.exe"
 
 if exist "%NASM_EXE%" (
 
-    set "PATH=%PATH%;C:\Users\Incredible\AppData\Local\bin\NASM"
+    set "PATH=%PATH%;C:\Users\%USERNAME%\AppData\Local\bin\NASM"
 
     echo         NASM added.
 

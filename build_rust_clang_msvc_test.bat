@@ -75,9 +75,9 @@ REM ==================================================
 echo [4/6] Checking optional tools...
 
 REM Check NASM
-set "NASM_EXE=C:\Users\Incredible\AppData\Local\bin\NASM\nasm.exe"
+set "NASM_EXE=C:\Users\%USERNAME%\AppData\Local\bin\NASM\nasm.exe"
 if exist "%NASM_EXE%" (
-    set "PATH=%PATH%;C:\Users\Incredible\AppData\Local\bin\NASM"
+    set "PATH=%PATH%;C:\Users\%USERNAME%\AppData\Local\bin\NASM"
     echo         NASM added.
 )
 
@@ -94,7 +94,7 @@ REM ==================================================
 REM  STEP 5: Project Directory
 REM ==================================================
 echo [5/6] Verifying project directory...
-set "PROJECT_DIR=C:\Users\Incredible\Code\clawcode\rust"
+set "PROJECT_DIR=C:\Users\%USERNAME%\Code\clawcode\rust"
 if not exist "%PROJECT_DIR%\Cargo.toml" (
     echo [FATAL] Cargo.toml not found in %PROJECT_DIR%
     pause

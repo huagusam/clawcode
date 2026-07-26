@@ -149,7 +149,6 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
         self.frame_index += 1;
         queue!(
             out,
@@ -157,7 +156,7 @@ impl Spinner {
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}")),
+            Print(format!("{label}")),
             ResetColor,
             RestorePosition
         )?;

@@ -30,6 +30,8 @@ A terminal-native AI coding assistant built in Rust. Connects to Anthropic's Mes
 - **ripgrep** (`rg.exe`) — place in `C:\Program Files\Git\bin`. Repository: [github.com/BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep). Download from [releases](https://github.com/BurntSushi/ripgrep/releases) (Windows zip, extract `rg.exe`).
 - **fd** (`fd.exe`) — place in `C:\Program Files\Git\bin`. Repository: [github.com/sharkdp/fd](https://github.com/sharkdp/fd). Download from [releases](https://github.com/sharkdp/fd/releases) (Windows zip, extract `fd.exe`).
 
+> Place `claw.exe` in a directory that is on your system `PATH`. If unsure where to put it, drop it in the Git Bash `bin\` directory alongside `rg.exe` and `fd.exe`.
+
 ### Build
 
 ```bat
@@ -50,7 +52,45 @@ run_local_openai.bat
 
 ### Configure
 
-Reference config lives in `.claw/` — place it in the project root for per-project settings, or at `~/.claw/` for a global user-level config. Copy `.env.example` to `.claw/.env` and set your API key or local endpoint.
+Reference config lives in `claw/` — place it in the project root to .claw/ for per-project settings, or at `~/.claw/` for a global user-level config. Copy `.env.example` to `.claw/.env` and set your API key or local endpoint.
+### WebSearch Configuration
+
+Put `web_search_url.json` in `~/.claw/` (global) or `.claw/` (project) to add extra search providers:
+
+```json
+{
+  "url_1": {
+    "enable": true,
+    "url": "https://www.bing.com/search?q={search} site:github.com"
+  }
+}
+```
+
+**Built-in default** (no file needed): `url_0` = general Bing search (`q={search}`), always active.
+Slots `url_1`–`url_4` are empty and disabled by default.
+
+The config file can add or override `url_1` through `url_4` for site-specific searches.
+Built-in `url_0` is always present and provides unrestricted search results alongside
+your custom providers. Toggle any entry on/off with `"enable": true` / `"enable": false`.
+
+**`{search}` placeholder:** The keyword and everything after `{search}` in the URL template
+is percent-encoded together as a single query value. Use a literal space (not `%20`) between
+`{search}` and any suffix — the space is encoded automatically.
+
+Example with query `ardour` and the template above:
+
+```
+Template: https://www.bing.com/search?q={search} site:github.com
+                                                                  ↓
+Suffix extracted:  site:github.com
+Keyword + suffix combined:  ardour site:github.com
+                                                                  ↓
+Percent-encoded query:  ardour%20site%3Agithub.com
+                                                                  ↓
+Final request:  GET https://www.bing.com/search?q=ardour%20site%3Agithub.com
+```
+
+Multiple enabled providers run in parallel; all results are aggregated.
 
 ### Claude Code Plugin Compatibility
 
@@ -63,7 +103,7 @@ Claw Code/
 ├── .claw/                        # Config (project-local; or use ~/.claw/ for global)
 │   ├── agents/                   # Sub-agent definitions
 │   ├── skills/                   # Skill workflow definitions
-│   ├── settings.json
+│   ├── settings.json &&  web_search_url.json
 │   └── .env
 ├── rust/                         # Rust workspace (binary: claw)
 │   ├── Cargo.toml

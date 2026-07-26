@@ -9,7 +9,7 @@
     },
     "search-mcp": {
       "type": "local",
-      "command": ["uv", "run", "--directory", "C:/Users/Incredible/openspace/free-search-mcp", "search-mcp"],
+      "command": ["uv", "run", "--directory", "C:/Users/%USERNAME%/openspace/free-search-mcp", "search-mcp"],
       "enabled": false
     },
   }

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -8,17 +9,19 @@ use telemetry::SessionTracer;
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
+use crate::compression_config::CompressionConfig;
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::image_store::ImageStore;
-use crate::session::{externalize_message_images, ContentBlock, ConversationMessage, Session};
+use crate::session::{externalize_message_images, ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const MAX_CONSECUTIVE_COMPACTIONS: usize = 3;
 
 fn parse_input_content(input: &str) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
@@ -282,6 +285,49 @@ impl RuntimeError {
     }
 }
 
+impl RuntimeError {
+    #[must_use]
+    pub fn is_context_window_error(&self) -> bool {
+        let msg = self.message.to_lowercase();
+        msg.contains("exceed_context_size_error")
+            || msg.contains("maximum context length")
+            || msg.contains("context window")
+            || msg.contains("context length")
+            || msg.contains("too many tokens")
+            || msg.contains("prompt is too long")
+            || msg.contains("input is too long")
+            || msg.contains("request is too large")
+            || msg.contains("exceeded")
+    }
+
+    /// Parse the model's context window size from the error message.
+    /// The error message may contain "context size (N tokens)" (runtime API error)
+    /// or "Context window   N tokens" (preflight check).
+    #[must_use]
+    pub fn context_window_tokens(&self) -> Option<u32> {
+        let msg = &self.message;
+        if let Some(start) = msg.find("context size (") {
+            let rest = &msg[start + "context size (".len()..];
+            if let Some(end) = rest.find(" tokens") {
+                return rest[..end].parse().ok();
+            }
+        }
+        if let Some(start) = msg.find("Context window   ") {
+            let rest = &msg[start + "Context window   ".len()..];
+            if let Some(end) = rest.find(" tokens") {
+                return rest[..end].parse().ok();
+            }
+        }
+        if let Some(start) = msg.find("context window ") {
+            let rest = &msg[start + "context window ".len()..];
+            if let Some(end) = rest.find('\n') {
+                return rest[..end].trim().parse().ok();
+            }
+        }
+        None
+    }
+}
+
 impl Display for RuntimeError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
@@ -323,6 +369,7 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    compression_config: CompressionConfig,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
@@ -382,6 +429,7 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            compression_config: CompressionConfig::from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -417,6 +465,12 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_compression_config(mut self, config: CompressionConfig) -> Self {
+        self.compression_config = config;
         self
     }
 
@@ -595,7 +649,10 @@ where
         // Arc::make_mut mutates in place when we're the sole owner (which is
         // the case after the previous stream() call has completed and dropped
         // its Arc handle).
-        let mut api_messages = Arc::new(crate::context::filter_for_api(&self.session.messages));
+        let mut api_messages = Arc::new(crate::context::filter_for_api_with_config(
+            &self.session.messages,
+            &self.compression_config,
+        ));
 
         self.drive_turn_loop(
             &mut prompter,
@@ -635,6 +692,7 @@ where
         prompt_cache_events: &mut Vec<PromptCacheEvent>,
         iterations: &mut usize,
     ) -> Result<(), RuntimeError> {
+        let mut compaction_retries = 0;
         loop {
             *iterations += 1;
             if *iterations > self.max_iterations {
@@ -652,6 +710,30 @@ where
             };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
+                Err(error) if error.is_context_window_error() => {
+                    if compaction_retries < MAX_CONSECUTIVE_COMPACTIONS {
+                        compaction_retries += 1;
+                        self.session.messages = vec![ConversationMessage {
+                            role: MessageRole::User,
+                            blocks: vec![ContentBlock::Text { text: String::new() }],
+                            usage: None,
+                            created_at: Instant::now(),
+                            cached_tokens: OnceLock::new(),
+                            cached_input_message: OnceLock::new(),
+                        }];
+                        *api_messages = Arc::new(
+                            crate::context::filter_for_api_with_config(
+                                &self.session.messages,
+                                &self.compression_config,
+                            ),
+                        );
+                        continue;
+                    }
+                    // all retries exhausted — silently reset
+                    self.session.messages.clear();
+                    *api_messages = Arc::new(Vec::new());
+                    break;
+                }
                 Err(error) => {
                     self.record_turn_failed(*iterations, &error);
                     return Err(error);
@@ -908,7 +990,10 @@ where
         self.forced_tool_ids.clear();
 
         // api_messages now reflects user + synthetic assistant + tool result.
-        let mut api_messages = Arc::new(crate::context::filter_for_api(&self.session.messages));
+        let mut api_messages = Arc::new(crate::context::filter_for_api_with_config(
+            &self.session.messages,
+            &self.compression_config,
+        ));
 
         self.drive_turn_loop(
             &mut prompter,
@@ -982,21 +1067,22 @@ where
             return None;
         }
 
-        // Anti-thrashing: if last compaction saved <10% of compactable tokens,
+        // Anti-thrashing: if last compaction saved below threshold,
         // skip this auto-compaction. Reset the lock so next turn re-evaluates.
         if let Some(ratio) = self.session.compaction.as_ref().and_then(|c| c.last_savings_ratio)
         {
-            if ratio < 0.10 {
+            if ratio < self.compression_config.antithrash_ratio {
                 self.session.set_compaction_savings_ratio(None);
                 return None;
             }
         }
 
+        let base = CompactionConfig::from_config(&self.compression_config);
         let result = compact_session(
             &self.session,
             CompactionConfig {
                 max_estimated_tokens: 0,
-                ..CompactionConfig::default()
+                ..base
             },
         );
 
@@ -1896,6 +1982,7 @@ mod tests {
             preserve_recent_tokens: 1,
             max_estimated_tokens: 1,
             preserve_last_n_turns: 0,
+            summary_budget: None,
         });
         assert!(result.summary.contains("Conversation summary"));
         assert_eq!(

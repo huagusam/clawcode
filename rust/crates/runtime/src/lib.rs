@@ -13,6 +13,7 @@ pub mod boundary;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
+pub mod compression_config;
 mod config;
 pub mod config_validate;
 mod context;
@@ -67,6 +68,7 @@ pub use compact::{
     format_compact_summary, get_compact_continuation_message, should_compact, CompactionConfig,
     CompactionResult,
 };
+pub use compression_config::CompressionConfig;
 pub use config::{
     default_config_home, parse_mcp_server_config, strip_verbatim_prefix, user_home_dir, ConfigEntry,
     ConfigError, ConfigLoader, ConfigSource, McpConfigCollection, McpManagedProxyServerConfig,
@@ -85,7 +87,7 @@ pub use conversation::{
     AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
     StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
 };
-pub use context::{estimate_message_tokens, filter_for_api};
+pub use context::{estimate_message_tokens, filter_for_api, filter_for_api_with_config};
 pub use file_ops::{
     edit_file, edit_file_with_policy, glob_search, grep_search, new_file, new_file_with_policy,
     normalize_path_for_output, read_file, read_file_with_policy, EditFileOutput, GlobSearchOutput,

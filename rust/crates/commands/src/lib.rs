@@ -4481,6 +4481,7 @@ mod tests {
                 preserve_recent_tokens: 1,
                 max_estimated_tokens: 1,
                 preserve_last_n_turns: 0,
+                summary_budget: None,
             },
         )
         .expect("slash command should be handled");

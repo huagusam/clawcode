@@ -1444,7 +1444,7 @@ mod tests {
         // The home boundary in `discover()` stops the ancestor walk at the
         // user's home directory, so the 2 entries the developer has at
         // `~/.claw/settings.json` and `~/.claude/settings.json` (under
-        // `C:\Users\Incredible\`) are NOT picked up by the test — this
+        // `C:\Users\%USERNAME%\`) are NOT picked up by the test — this
         // temp project lives under `%TEMP%` which is below the home on
         // Windows. The test is hermetic: 2 entries, exactly the 2 fixtures.
         assert_eq!(loaded.loaded_entries().len(), 2);

@@ -275,11 +275,11 @@ If `new_string` is shorter than `old_string`, confirm you are intentionally remo
         },
         ToolSpec {
             name: "WebSearch",
-            description: "Search the web for current info. Provide a SINGLE most-critical keyword only (e.g. '光辉岁月' not '黄家驹 光辉岁月 歌词').",
+            description: "Search the web for current info.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "minLength": 1, "description": "ONE keyword: the single most critical search term. Strip modifiers, adjectives, and extraneous words." },
+                    "query": { "type": "string", "minLength": 1, "description": "Search query." },
                     "max_results": { "type": "integer", "minimum": 1, "description": "Maximum number of search results to return. Default is provider-dependent." }
                 },
                 "required": ["query"],

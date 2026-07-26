@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use agents::{
@@ -42,7 +43,7 @@ fn global_webfetch_cache(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Cache TTL: 2.5 minutes (aligned with context window TTL for WebFetch).
+/// Cache TTL: 20 seconds.
 const WEBFETCH_CACHE_TTL_SECS: u64 = 20;
 
 /// File content cache. Stores file contents written by new_file/edit_file
@@ -517,6 +518,7 @@ fn resolve_known_tool_name(name: &str) -> String {
 const KNOWN_TOOL_ALIASES: &[(&str, &str)] = &[
     ("Write", "new_file"),
     ("write_file", "new_file"),
+    ("web_search", "WebSearch"),
 ];
 
 fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
@@ -561,6 +563,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
 /// (e.g. via `tools_init` in two `#[test]` functions sharing the same
 /// static) do not fail.
 pub fn tools_init() -> Result<(), String> {
+    init_web_search_config();
     agents::init_global_runtime();
     use agents::register_tool_executor;
     match register_tool_executor(Box::new(|name, value, _policy| execute_tool(name, value))) {
@@ -2437,13 +2440,12 @@ mod tests {
             .expect("WebSearch must return JSON even without API key");
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("output must be valid JSON");
-        assert_eq!(parsed["query"], "rust");
+        assert_eq!(parsed["query"], "rust web search");
+        let provider = parsed["provider"].as_str().unwrap_or("none");
         assert!(
-            parsed["provider"].as_str().unwrap_or("").split('+').all(|p| {
-                ["eastmoney", "donews", "36kr", "bing_cnblogs", "bkso", "none"].contains(&p)
-            }),
+            provider == "none" || provider.split('+').all(|p| !p.is_empty()),
             "unexpected provider: {}",
-            parsed["provider"]
+            provider
         );
         assert!(parsed["resultsReturned"].is_number());
         assert!(parsed["results"].is_array());
@@ -2459,7 +2461,7 @@ mod tests {
             .expect("WebSearch must return JSON even without API key");
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("output must be valid JSON");
-        assert_eq!(parsed["query"], "generic");
+        assert_eq!(parsed["query"], "generic links");
     }
 
     #[test]
@@ -4147,9 +4149,9 @@ fn run_grep_search(input: runtime::GrepSearchInput) -> Result<String, String> {
 // `{code, url, result}` so callers can drive further processing (title
 // extraction, line-based slicing) off the result field. HTML responses
 // are passed through `html_to_text`; other content types are returned
-// verbatim. The 5 MB body cap and 30 s timeout keep the tool cheap
+// verbatim. The 5 MB body cap and 10 s timeout keep the tool cheap
 // to call from a model that may request many pages in parallel.
-const WEB_FETCH_TIMEOUT_SECS: u64 = 30;
+const WEB_FETCH_TIMEOUT_SECS: u64 = 10;
 const WEB_FETCH_MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 
 // Heuristic: when a Wikipedia URL is unreachable (the source is
@@ -4398,13 +4400,82 @@ fn node_text(node: &scraper::ElementRef) -> String {
     node.text().collect::<String>().trim().to_string()
 }
 
-const BKSO_URL: &str = "https://baike.baidu.com/search?word={search}";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WebSearchProviderConfig {
+    #[serde(default = "default_enable")]
+    enable: bool,
+    url: Option<String>,
+}
 
-const EASTMONEY_URL: &str = "https://so.eastmoney.com/web/s?keyword={search}";
-const DONEWS_URL: &str = "https://www.donews.com/search/search_word.html?keyword={search}";
-const KR36_URL: &str = "https://36kr.com/search/articles/{search}";
-const BING_CNBLOGS_URL: &str = "https://cn.bing.com/search?q={search}+site%3awww.cnblogs.com&FORM=BESBTB";
+fn default_enable() -> bool {
+    true
+}
 
+const DEFAULT_WEB_SEARCH_PROVIDERS: &[(&str, Option<&str>)] = &[
+    ("url_0", Some("https://www.bing.com/search?q={search}")),
+    ("url_1", None),
+    ("url_2", None),
+    ("url_3", None),
+    ("url_4", None),
+];
+
+fn load_web_search_config() -> HashMap<String, WebSearchProviderConfig> {
+    let mut configs: HashMap<String, WebSearchProviderConfig> = DEFAULT_WEB_SEARCH_PROVIDERS
+        .iter()
+        .map(|(name, url)| {
+            let has_url = url.is_some();
+            (
+                name.to_string(),
+                WebSearchProviderConfig {
+                    enable: has_url,
+                    url: url.map(|u| u.to_string()),
+                },
+            )
+        })
+        .collect();
+
+    let merge_from = |path: std::path::PathBuf, target: &mut HashMap<String, WebSearchProviderConfig>| {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[websearch] failed to read config '{}': {e}", path.display());
+                }
+                return;
+            }
+        };
+        let overrides: HashMap<String, WebSearchProviderConfig> = match serde_json::from_str(&content) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[websearch] failed to parse config '{}': {e}", path.display());
+                return;
+            }
+        };
+        for (key, entry) in overrides {
+            if let Some(existing) = target.get_mut(&key) {
+                if let Some(url) = entry.url {
+                    existing.url = Some(url);
+                }
+                existing.enable = entry.enable;
+            } else {
+                target.insert(key, entry);
+            }
+        }
+    };
+
+    let user_config = default_config_home().join("web_search_url.json");
+    merge_from(user_config, &mut configs);
+
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            let project_config = cwd.join(".claw").join("web_search_url.json");
+            merge_from(project_config, &mut configs);
+        }
+        Err(e) => eprintln!("[websearch] cannot determine current dir for project config: {e}"),
+    }
+
+    configs
+}
 
 fn percent_encode_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -4421,7 +4492,15 @@ fn percent_encode_query(s: &str) -> String {
 }
 
 fn build_search_url(template: &str, query: &str) -> String {
-    template.replace("{search}", &percent_encode_query(query))
+    let marker = "{search}";
+    if let Some(idx) = template.find(marker) {
+        let prefix = &template[..idx];
+        let suffix = &template[idx + marker.len()..];
+        let combined = format!("{query}{suffix}");
+        format!("{prefix}{}", percent_encode_query(&combined))
+    } else {
+        template.to_string()
+    }
 }
 
 fn fetch_search_html(client: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
@@ -4471,85 +4550,42 @@ fn extract_generic_results(
     results
 }
 
-fn scrape_eastmoney(
+fn scrape_url_generic(
     client: &reqwest::blocking::Client,
+    url_template: &str,
     query: &str,
+    source: &str,
 ) -> Result<Vec<ScrapedSearchResult>, String> {
-    let url = build_search_url(EASTMONEY_URL, query);
+    let url = build_search_url(url_template, query);
     let html = fetch_search_html(client, &url)?;
-    Ok(extract_generic_results(
+    let results = extract_generic_results(
         &html,
-        &["div.search_result_item", "div.news-item", "li.result-item"],
-        &["h3 a", "div.title a", "a.title"],
-        &["p.detail", "div.desc", "div.abstract"],
-        "eastmoney.com",
-    ))
-}
-
-fn scrape_donews(
-    client: &reqwest::blocking::Client,
-    query: &str,
-) -> Result<Vec<ScrapedSearchResult>, String> {
-    let url = build_search_url(DONEWS_URL, query);
-    let html = fetch_search_html(client, &url)?;
-    Ok(extract_generic_results(
-        &html,
-        &["div.search_result", "ul.search-list li", "div.result-item"],
-        &["h3 a", "div.title a", "a"],
-        &["p", "div.desc", "div.summary", "span.detail"],
-        "donews.com",
-    ))
-}
-
-fn scrape_36kr(
-    client: &reqwest::blocking::Client,
-    query: &str,
-) -> Result<Vec<ScrapedSearchResult>, String> {
-    let url = build_search_url(KR36_URL, query);
-    let html = fetch_search_html(client, &url)?;
-    let mut results = extract_generic_results(
-        &html,
-        &["div.search-article-item", "div.article-item", "div.common-item", "li.item"],
-        &["a.article-title", "a.title", "a"],
-        &["p.article-desc", "p.desc", "div.summary", "p"],
-        "36kr.com",
+        &[".result", ".search-result", ".result-item", ".g", "li.b_algo"],
+        &["h3 a", "h2 a", ".title a"],
+        &["p", ".st", ".b_caption p", ".desc", ".snippet"],
+        source,
     );
-    for r in &mut results {
-        if !r.link.starts_with("http") {
-            r.link = format!("https://36kr.com{}", if r.link.starts_with('/') { String::new() } else { "/".to_string() } + &r.link);
-        }
-    }
     Ok(results)
 }
 
-fn scrape_bing_cnblogs(
-    client: &reqwest::blocking::Client,
-    query: &str,
-) -> Result<Vec<ScrapedSearchResult>, String> {
-    let url = build_search_url(BING_CNBLOGS_URL, query);
-    let html = fetch_search_html(client, &url)?;
-    Ok(extract_generic_results(
-        &html,
-        &["li.b_algo"],
-        &["h2 a"],
-        &[".b_caption p"],
-        "",
-    ))
+static WEB_SEARCH_CONFIG: OnceLock<HashMap<String, WebSearchProviderConfig>> = OnceLock::new();
+
+pub fn init_web_search_config() {
+    WEB_SEARCH_CONFIG.get_or_init(load_web_search_config);
 }
 
-fn scrape_bkso(
-    client: &reqwest::blocking::Client,
-    query: &str,
-) -> Result<Vec<ScrapedSearchResult>, String> {
-    let url = build_search_url(BKSO_URL, query);
-    let html = fetch_search_html(client, &url)?;
-    Ok(extract_generic_results(
-        &html,
-        &["dl.search-list dd", "div.result-item", "div.search-result-item", "li.result"],
-        &["a.result-title", "dt a", "a.t", "a"],
-        &["p.result-summary", "dd p", "div.abstract", "p"],
-        "baike.baidu.com",
-    ))
+fn web_search_enabled_providers() -> Vec<(String, String)> {
+    let config = WEB_SEARCH_CONFIG.get_or_init(load_web_search_config);
+    const MAX_PROVIDERS: usize = 5;
+    config
+        .iter()
+        .filter(|(_, entry)| entry.enable)
+        .filter_map(|(name, entry)| {
+            let url = entry.url.clone().unwrap_or_default();
+            if url.is_empty() { None } else { Some((name.clone(), url)) }
+        })
+        .take(MAX_PROVIDERS)
+        .collect()
 }
 
 fn run_web_search(input: WebSearchInput) -> Result<String, String> {
@@ -4559,7 +4595,7 @@ fn run_web_search(input: WebSearchInput) -> Result<String, String> {
         .min(SEARCHAPI_MAX_RESULTS)
         .max(1);
 
-    let keyword = input.query.split_whitespace().next().unwrap_or("").to_string();
+    let keyword = input.query.trim().to_string();
 
     use std::sync::mpsc;
 
@@ -4575,26 +4611,29 @@ fn run_web_search(input: WebSearchInput) -> Result<String, String> {
             .map_err(|e| e.to_string())?,
     );
 
-    let providers: Vec<(&str, fn(&reqwest::blocking::Client, &str) -> Result<Vec<ScrapedSearchResult>, String>)> = vec![
-        ("eastmoney", scrape_eastmoney),
-        ("donews", scrape_donews),
-        ("36kr", scrape_36kr),
-        ("bing_cnblogs", scrape_bing_cnblogs),
-        ("bkso", scrape_bkso),
-    ];
+    let providers = web_search_enabled_providers();
+
+    if providers.is_empty() {
+        return format_search_response(&keyword, "none", Vec::new(), max_results, &[]);
+    }
 
     let (tx, rx) = mpsc::channel::<(String, Result<Vec<ScrapedSearchResult>, String>)>();
     let query = std::sync::Arc::new(keyword.clone());
 
-    for (name, scraper) in &providers {
+    for (name, url_template) in &providers {
         let tx = tx.clone();
         let client = std::sync::Arc::clone(&client);
         let query = std::sync::Arc::clone(&query);
-        let name = name.to_string();
-        let scraper = *scraper;
+        let name = name.clone();
+        let url_template = url_template.clone();
+        let source = name.clone();
 
         std::thread::spawn(move || {
-            let _ = tx.send((name, scraper(&client, &query)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scrape_url_generic(&client, &url_template, &query, &source)
+            }))
+            .unwrap_or(Err("provider thread panicked".to_string()));
+            let _ = tx.send((name, result));
         });
     }
 
@@ -4606,7 +4645,8 @@ fn run_web_search(input: WebSearchInput) -> Result<String, String> {
 
     for (name, result) in rx {
         match result {
-            Ok(results) if !results.is_empty() => {
+            Ok(mut results) if !results.is_empty() => {
+                results.truncate(SEARCHAPI_DEFAULT_RESULTS);
                 providers_used.push(name);
                 all_results.extend(results);
             }

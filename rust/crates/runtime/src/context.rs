@@ -8,53 +8,42 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::session::{ContentBlock, ConversationMessage, MessageRole};
-
-/// Minimum output size (bytes) to trigger filtering in API context.
-const TOOLRESULT_MIN_BYTES: usize = 500;
-
-/// Number of recent messages whose ToolResult output is preserved verbatim.
-/// Older messages have large ToolResults replaced with structured summaries.
-const PRESERVE_RECENT_MESSAGES: usize = 6;
+use crate::compression_config::CompressionConfig;
+use crate::session::{ContentBlock, ConversationMessage};
 
 /// Tools whose output should be compressed in subsequent API rounds.
 const FILTER_TOOLS: &[&str] = &[
     "WebFetch", "WebSearch", "read_file", "new_file", "edit_file", "bash", "grep_search",
 ];
 
-/// WebSearch results expire after 30 seconds.
-const WEBSEARCH_TTL_SECS: u64 = 15;
-/// WebFetch results expire after 60 seconds.
-const WEBFETCH_TTL_SECS: u64 = 60;
-
 /// Check whether a time-sensitive tool result has exceeded its TTL.
-fn tool_result_expired(tool_name: &str, created_at: Instant) -> bool {
+fn tool_result_expired(tool_name: &str, created_at: Instant, config: &CompressionConfig) -> bool {
     let ttl = match tool_name {
-        "WebSearch" => WEBSEARCH_TTL_SECS,
-        "WebFetch" => WEBFETCH_TTL_SECS,
+        "WebSearch" => config.websearch_ttl_secs,
+        "WebFetch" => config.webfetch_ttl_secs,
         _ => return false,
     };
     created_at.elapsed().as_secs() >= ttl
 }
 
-/// Filters conversation messages for LLM API requests.
+/// Filters conversation messages for LLM API requests, using the global defaults.
 ///
 /// - Thinking blocks: content removed, signature preserved for API round-trip.
 /// - Large ToolResult (WebFetch, read_file, new_file, edit_file, bash, grep_search):
 ///   output replaced with structured summary to avoid re-sending content that
 ///   the AI has already processed.
-/// - Position-aware: the last [`PRESERVE_RECENT_MESSAGES`] messages keep their
+/// - Position-aware: the last N messages (configurable via env var) keep their
 ///   full ToolResult output so the model retains access to recent context.
 pub fn filter_for_api(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
-    filter_for_api_inner(messages, PRESERVE_RECENT_MESSAGES)
+    filter_for_api_with_config(messages, CompressionConfig::global())
 }
 
-/// Internal implementation with configurable preservation window.
-fn filter_for_api_inner(
+/// Filters conversation messages with explicit config.
+pub fn filter_for_api_with_config(
     messages: &[ConversationMessage],
-    preserve_recent: usize,
+    config: &CompressionConfig,
 ) -> Vec<ConversationMessage> {
-    let preserve_from = messages.len().saturating_sub(preserve_recent);
+    let preserve_from = messages.len().saturating_sub(config.preserve_recent_messages);
     messages
         .iter()
         .enumerate()
@@ -77,10 +66,10 @@ fn filter_for_api_inner(
                         output,
                         is_error,
                     } if !is_error
-                        && output.len() > TOOLRESULT_MIN_BYTES
+                        && output.len() > config.toolresult_min_bytes
                         && FILTER_TOOLS.contains(&tool_name.as_str())
                         && (!is_recent
-                            || tool_result_expired(tool_name, msg.created_at)) =>
+                            || tool_result_expired(tool_name, msg.created_at, config)) =>
                     {
                         // Generate structured summary preserving key metadata.
                         let summary = summarize_tool_result(tool_name, output);
@@ -194,17 +183,25 @@ pub(crate) fn summarize_tool_result(tool_name: &str, output: &str) -> String {
 
 /// Extract a string value from a JSON object by key.
 fn extract_json_str(json: &str, key: &str) -> Option<String> {
-    // Fast path: search for "key":"value" pattern without full JSON parse
     let pattern = format!("\"{key}\":");
     let idx = json.find(&pattern)?;
     let rest = &json[idx + pattern.len()..];
     let rest = rest.trim_start();
-    if rest.starts_with('"') {
-        let end = rest[1..].find('"')?;
-        Some(rest[1..1 + end].to_string())
-    } else {
-        None
+    if !rest.starts_with('"') {
+        return None;
     }
+    let inner = &rest[1..];
+    let mut end = None;
+    let mut chars = inner.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == '"' {
+            end = Some(i);
+            break;
+        }
+    }
+    Some(inner[..end?].to_string())
 }
 
 /// Extract a numeric value from a JSON object by key.
@@ -213,12 +210,11 @@ fn extract_json_num(json: &str, key: &str) -> Option<String> {
     let idx = json.find(&pattern)?;
     let rest = &json[idx + pattern.len()..];
     let rest = rest.trim_start();
-    // Number or null
     if rest.starts_with("null") {
-        return Some("null".to_string());
+        return None;
     }
     let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.')
+        .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.' && c != 'e' && c != 'E')
         .unwrap_or(rest.len());
     if end > 0 {
         Some(rest[..end].to_string())
@@ -228,62 +224,29 @@ fn extract_json_num(json: &str, key: &str) -> Option<String> {
 }
 
 /// Estimates token count for a single message.
-/// Uses tiktoken `cl100k_base` when available, falls back to `chars/4`.
-/// Delegates text-level estimation to [`crate::compact::estimate_text_tokens`]
-/// for a single authoritative implementation across the crate.
+/// Delegates to the canonical implementation in `compact.rs`.
 pub fn estimate_message_tokens(message: &ConversationMessage) -> usize {
-    // Use cached value if available (populated by compact.rs).
-    if let Some(cached) = message.cached_tokens.get() {
-        return *cached;
-    }
-
-    let mut tokens = 0;
-    // Role overhead
-    tokens += match message.role {
-        MessageRole::System => 4,
-        MessageRole::User => 4,
-        MessageRole::Assistant => 3,
-        MessageRole::Tool => 5,
-    };
-
-    for block in &message.blocks {
-        tokens += match block {
-            ContentBlock::Text { text } => crate::compact::estimate_text_tokens(text),
-            ContentBlock::ToolUse { name, input, .. } => {
-                let input_str = input.to_string();
-                3 + crate::compact::estimate_text_tokens(name)
-                    + crate::compact::estimate_text_tokens(&input_str)
-            }
-            ContentBlock::ToolResult {
-                tool_name, output, ..
-            } => {
-                3 + crate::compact::estimate_text_tokens(tool_name)
-                    + crate::compact::estimate_text_tokens(output)
-            }
-            ContentBlock::Image { data, .. } => {
-                // Base64 is 33% inflated → decode bytes = len * 3/4.
-                let bytes = data.len() * 3 / 4;
-                bytes / 750 + 20
-            }
-            ContentBlock::ImageRef { .. } => 100,
-            ContentBlock::Thinking { thinking, .. } => {
-                crate::compact::estimate_text_tokens(thinking)
-            }
-        };
-    }
-
-    tokens
+    crate::compact::estimate_message_tokens(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression_config::CompressionConfig;
+    use crate::session::MessageRole;
     use std::sync::OnceLock;
 
     fn make_thinking_block(content: &str, sig: Option<&str>) -> ContentBlock {
         ContentBlock::Thinking {
             thinking: content.to_string(),
             signature: sig.map(String::from),
+        }
+    }
+
+    fn config_with_preserve(preserve: usize) -> CompressionConfig {
+        CompressionConfig {
+            preserve_recent_messages: preserve,
+            ..CompressionConfig::default()
         }
     }
 
@@ -314,8 +277,8 @@ mod tests {
         assert!(thinking_block.is_some());
 
         if let ContentBlock::Thinking { thinking, signature } = thinking_block.unwrap() {
-            assert_eq!(thinking, ""); // Content stripped
-            assert_eq!(signature, &Some("sig123".to_string())); // Signature preserved
+            assert_eq!(thinking, "");
+            assert_eq!(signature, &Some("sig123".to_string()));
         }
     }
 
@@ -361,8 +324,8 @@ mod tests {
             cached_input_message: OnceLock::new(),
         };
 
-        // Use preserve_recent=0 to test compression regardless of position
-        let filtered = filter_for_api_inner(&[msg], 0);
+        let config = config_with_preserve(0);
+        let filtered = filter_for_api_with_config(&[msg], &config);
         if let ContentBlock::ToolResult { output, .. } = &filtered[0].blocks[0] {
             assert!(output.starts_with("[read_file: src/session.rs"));
             assert!(output.contains("1200 lines"));
@@ -393,8 +356,8 @@ mod tests {
             cached_input_message: OnceLock::new(),
         };
 
-        // Use preserve_recent=0 to test compression regardless of position
-        let filtered = filter_for_api_inner(&[msg], 0);
+        let config = config_with_preserve(0);
+        let filtered = filter_for_api_with_config(&[msg], &config);
         if let ContentBlock::ToolResult { output, .. } = &filtered[0].blocks[0] {
             assert!(output.starts_with("[bash: exit=0"));
             assert!(output.contains("test result: ok"));
@@ -481,9 +444,6 @@ mod tests {
 
     #[test]
     fn filter_drops_thinking_only_messages() {
-        // A message with ONLY a Thinking block should be dropped entirely,
-        // because after API conversion strips Thinking blocks it would become
-        // an empty message, causing cached_message_values index misalignment.
         let msg = ConversationMessage {
             role: MessageRole::Assistant,
             blocks: vec![make_thinking_block("some reasoning...", Some("sig_abc"))],
@@ -503,7 +463,6 @@ mod tests {
 
     #[test]
     fn filter_preserves_assistant_with_text_and_thinking() {
-        // A message with Text + Thinking should be preserved (not dropped).
         let msg = ConversationMessage {
             role: MessageRole::Assistant,
             blocks: vec![
@@ -524,7 +483,6 @@ mod tests {
 
     #[test]
     fn filter_compresses_websearch_results() {
-        // given
         let search_output = serde_json::json!({
             "query": "rust async runtime",
             "provider": "bing",
@@ -537,7 +495,6 @@ mod tests {
             ]
         }).to_string();
 
-        // Ensure output exceeds TOOLRESULT_MIN_BYTES (500)
         assert!(search_output.len() > 500, "test data too small: {} bytes", search_output.len());
 
         let msg = ConversationMessage {
@@ -554,10 +511,9 @@ mod tests {
             cached_input_message: OnceLock::new(),
         };
 
-        // when - message is old (not in recent window)
-        let filtered = filter_for_api_inner(&[msg], 0);
+        let config = config_with_preserve(0);
+        let filtered = filter_for_api_with_config(&[msg], &config);
 
-        // then
         if let ContentBlock::ToolResult { output, .. } = &filtered[0].blocks[0] {
             assert!(output.starts_with("[WebSearch:"), "got: {output}");
             assert!(output.contains("rust async runtime"), "got: {output}");
@@ -569,7 +525,6 @@ mod tests {
         }
     }
 
-    /// Helper: build a large WebSearch JSON output (>500 bytes).
     fn large_websearch_output() -> String {
         serde_json::json!({
             "query": "rust async runtime",
@@ -585,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn websearch_expires_after_30s() {
+    fn websearch_expires_by_default_ttl() {
         let output = large_websearch_output();
         assert!(output.len() > 500);
 
@@ -598,14 +553,14 @@ mod tests {
                 is_error: false,
             }],
             usage: None,
-            // Simulate 31 seconds ago
+            // 31s > default 15s TTL → expired
             created_at: Instant::now() - std::time::Duration::from_secs(31),
             cached_tokens: OnceLock::new(),
             cached_input_message: OnceLock::new(),
         };
 
-        // Even within the recent window (preserve_recent=10), TTL should trigger compression
-        let filtered = filter_for_api_inner(&[msg], 10);
+        let config = config_with_preserve(10);
+        let filtered = filter_for_api_with_config(&[msg], &config);
         if let ContentBlock::ToolResult { output, .. } = &filtered[0].blocks[0] {
             assert!(
                 output.starts_with("[WebSearch:"),
@@ -617,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn webfetch_expires_after_60s() {
+    fn webfetch_expires_by_default_ttl() {
         let output = serde_json::json!({
             "url": "https://example.com",
             "content": "X".repeat(600)
@@ -634,13 +589,14 @@ mod tests {
                 is_error: false,
             }],
             usage: None,
-            // Simulate 61 seconds ago
+            // 61s > default 30s TTL → expired
             created_at: Instant::now() - std::time::Duration::from_secs(61),
             cached_tokens: OnceLock::new(),
             cached_input_message: OnceLock::new(),
         };
 
-        let filtered = filter_for_api_inner(&[msg], 10);
+        let config = config_with_preserve(10);
+        let filtered = filter_for_api_with_config(&[msg], &config);
         if let ContentBlock::ToolResult { output, .. } = &filtered[0].blocks[0] {
             assert!(
                 output.starts_with("[WebFetch:"),
@@ -665,14 +621,14 @@ mod tests {
                 is_error: false,
             }],
             usage: None,
-            // Created 5 seconds ago — well within 30s TTL
+            // 5s < default 15s TTL → not expired
             created_at: Instant::now() - std::time::Duration::from_secs(5),
             cached_tokens: OnceLock::new(),
             cached_input_message: OnceLock::new(),
         };
 
-        // Within recent window AND within TTL → should be preserved
-        let filtered = filter_for_api_inner(&[msg], 10);
+        let config = config_with_preserve(10);
+        let filtered = filter_for_api_with_config(&[msg], &config);
         if let ContentBlock::ToolResult { output, .. } = &filtered[0].blocks[0] {
             assert!(
                 output.contains("rust async runtime"),
@@ -681,5 +637,47 @@ mod tests {
         } else {
             panic!("Expected ToolResult");
         }
+    }
+
+    #[test]
+    fn extract_json_str_handles_escaped_quotes() {
+        let json = r#"{"path":"file with \"quotes\"","other":"val"}"#;
+        assert_eq!(
+            extract_json_str(json, "path"),
+            Some(r#"file with \"quotes\""#.to_string())
+        );
+    }
+
+    #[test]
+    fn extract_json_str_handles_backslash() {
+        let json = r#"{"path":"C:\\Users\\file.txt"}"#;
+        assert_eq!(
+            extract_json_str(json, "path"),
+            Some(r#"C:\\Users\\file.txt"#.to_string())
+        );
+    }
+
+    #[test]
+    fn extract_json_str_missing_key_returns_none() {
+        let json = r#"{"a":1,"b":2}"#;
+        assert_eq!(extract_json_str(json, "c"), None);
+    }
+
+    #[test]
+    fn extract_json_num_returns_none_for_null() {
+        let json = r#"{"exitCode":null}"#;
+        assert_eq!(extract_json_num(json, "exitCode"), None);
+    }
+
+    #[test]
+    fn extract_json_num_handles_scientific_notation() {
+        let json = r#"{"value":1.5e10}"#;
+        assert_eq!(extract_json_num(json, "value"), Some("1.5e10".to_string()));
+    }
+
+    #[test]
+    fn extract_json_num_missing_key_returns_none() {
+        let json = r#"{"a":1}"#;
+        assert_eq!(extract_json_num(json, "b"), None);
     }
 }

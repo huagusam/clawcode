@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-set "TARGET_DIR=C:\Users\Incredible\.claw\sessions"
+set "TARGET_DIR=C:\Users\%USERNAME%\.claw\sessions"
 if not exist "%TARGET_DIR%" (
     echo 错误：目录不存在！
     pause
@@ -77,9 +77,9 @@ REM ==================================================
 echo [4/6] Checking optional tools...
 
 REM Check NASM
-set "NASM_EXE=C:\Users\Incredible\AppData\Local\bin\NASM\nasm.exe"
+set "NASM_EXE=C:\Users\%USERNAME%\AppData\Local\bin\NASM\nasm.exe"
 if exist "%NASM_EXE%" (
-    set "PATH=%PATH%;C:\Users\Incredible\AppData\Local\bin\NASM"
+    set "PATH=%PATH%;C:\Users\%USERNAME%\AppData\Local\bin\NASM"
     echo         NASM added.
 )
 
