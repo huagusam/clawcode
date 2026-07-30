@@ -1,0 +1,15 @@
+/rust/target/
+
+.claw/.env
+.claw/sessions/
+.claw/diffs/
+.claw/images/
+.claw/sandbox/
+
+claw/.env
+claw/sessions/
+claw/diffs/
+claw/images/
+claw/sandbox/
+
+*.exe
