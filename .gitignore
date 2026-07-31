@@ -1,4 +1,5 @@
 /rust/target/
+/rust/Cargo.lock
 
 .claw/.env
 .claw/sessions/
