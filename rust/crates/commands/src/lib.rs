@@ -977,6 +977,9 @@ pub enum SlashCommand {
     Model {
         model: Option<String>,
     },
+    Temperature {
+        value: Option<String>,
+    },
     Permissions {
         mode: Option<String>,
     },
@@ -3853,6 +3856,7 @@ pub fn handle_slash_command(
         SlashCommand::Status
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
+        | SlashCommand::Temperature { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost

@@ -34,7 +34,7 @@ pub struct ConfigEntry {
 }
 
 /// Fully merged runtime configuration plus parsed feature-specific views.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     merged: BTreeMap<String, JsonValue>,
     loaded_entries: Vec<ConfigEntry>,
@@ -45,7 +45,7 @@ pub struct RuntimeConfig {
 pub use clawcode_plugin_types::RuntimePluginConfig;
 
 /// Structured feature configuration consumed by runtime subsystems.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
@@ -58,6 +58,7 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    temperature: Option<f64>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -357,6 +358,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            temperature: parse_optional_temperature(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -456,6 +458,11 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn temperature(&self) -> Option<f64> {
+        self.feature_config.temperature
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -524,6 +531,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn temperature(&self) -> Option<f64> {
+        self.temperature
     }
 }
 
@@ -784,6 +796,13 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn parse_optional_temperature(root: &JsonValue) -> Option<f64> {
+    root.as_object()
+        .and_then(|object| object.get("temperature"))
+        .and_then(JsonValue::as_f64)
+        .map(|value| value.clamp(0.0, 2.0))
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {

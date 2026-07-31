@@ -93,6 +93,7 @@ enum FieldType {
     Object,
     StringArray,
     Number,
+    Float,
 }
 
 impl FieldType {
@@ -103,6 +104,7 @@ impl FieldType {
             Self::Object => "an object",
             Self::StringArray => "an array of strings",
             Self::Number => "a number",
+            Self::Float => "a number",
         }
     }
 
@@ -115,6 +117,7 @@ impl FieldType {
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
             Self::Number => value.as_i64().is_some(),
+            Self::Float => value.as_f64().is_some(),
         }
     }
 }
@@ -124,6 +127,7 @@ fn json_type_label(value: &JsonValue) -> &'static str {
         JsonValue::Null => "null",
         JsonValue::Bool(_) => "a boolean",
         JsonValue::Number(_) => "a number",
+        JsonValue::Float(_) => "a number",
         JsonValue::String(_) => "a string",
         JsonValue::Array(_) => "an array",
         JsonValue::Object(_) => "an object",
@@ -204,6 +208,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "defaultMode",
         expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "temperature",
+        expected: FieldType::Float,
     },
 ];
 

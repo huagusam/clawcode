@@ -168,6 +168,19 @@ fn max_tokens_for_model(model: &str) -> u32 {
         64_000
     }
 }
+
+fn parse_temperature_value(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid value for --temperature: '{raw}'; must be a number"))?;
+    if !(0.0..=2.0).contains(&value) {
+        return Err(format!(
+            "invalid value for --temperature: '{raw}'; must be between 0.0 and 2.0"
+        ));
+    }
+    Ok(value)
+}
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
@@ -432,6 +445,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             compact,
             reasoning_effort,
+            temperature,
             allow_broad_cwd,
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
@@ -452,6 +466,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
+            cli.set_temperature(resolve_temperature(temperature));
             cli.run_turn_with_output(&resolved_prompt, output_format, compact)?;
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
@@ -502,12 +517,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             reasoning_effort,
+            temperature,
             allow_broad_cwd,
         } => run_repl(
             model,
             allowed_tools,
             permission_mode,
             reasoning_effort,
+            resolve_temperature(temperature),
             allow_broad_cwd,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
@@ -516,7 +533,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum CliAction {
     DumpManifests {
         output_format: CliOutputFormat,
@@ -575,6 +592,7 @@ enum CliAction {
         permission_mode: PermissionMode,
         compact: bool,
         reasoning_effort: Option<String>,
+        temperature: Option<f64>,
         allow_broad_cwd: bool,
     },
     Doctor {
@@ -605,6 +623,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         reasoning_effort: Option<String>,
+        temperature: Option<f64>,
         allow_broad_cwd: bool,
     },
     HelpTopic(LocalHelpTopic),
@@ -662,6 +681,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut allowed_tool_values = Vec::new();
     let mut compact = false;
     let mut reasoning_effort: Option<String> = None;
+    let mut temperature: Option<f64> = None;
     let mut allow_broad_cwd = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
@@ -783,6 +803,18 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 reasoning_effort = Some(value.to_string());
                 index += 1;
             }
+            "--temperature" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --temperature".to_string())?;
+                temperature = Some(parse_temperature_value(value)?);
+                index += 2;
+            }
+            flag if flag.starts_with("--temperature=") => {
+                let value = &flag[14..];
+                temperature = Some(parse_temperature_value(value)?);
+                index += 1;
+            }
             "--allow-broad-cwd" => {
                 allow_broad_cwd = true;
                 index += 1;
@@ -802,6 +834,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         .unwrap_or_else(default_permission_mode),
                     compact,
                     reasoning_effort: reasoning_effort.clone(),
+                    temperature,
                     allow_broad_cwd,
                 });
             }
@@ -909,6 +942,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     output_format,
                     compact: false,
                     reasoning_effort,
+                    temperature,
                     allow_broad_cwd,
                 });
             }
@@ -918,6 +952,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             reasoning_effort: reasoning_effort.clone(),
+            temperature,
             allow_broad_cwd,
         });
     }
@@ -1017,6 +1052,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode,
                     compact,
                     reasoning_effort: reasoning_effort.clone(),
+                    temperature,
                     allow_broad_cwd,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
@@ -1042,6 +1078,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 reasoning_effort: reasoning_effort.clone(),
+                temperature,
                 allow_broad_cwd,
             })
         }
@@ -1053,6 +1090,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             reasoning_effort,
+            temperature,
             allow_broad_cwd,
         ),
         other => {
@@ -1085,6 +1123,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 reasoning_effort: reasoning_effort.clone(),
+                temperature,
                 allow_broad_cwd,
             })
         }
@@ -1488,6 +1527,7 @@ fn parse_direct_slash_cli_action(
     permission_mode: PermissionMode,
     compact: bool,
     reasoning_effort: Option<String>,
+    temperature: Option<f64>,
     allow_broad_cwd: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
@@ -1516,6 +1556,7 @@ fn parse_direct_slash_cli_action(
                     permission_mode,
                     compact,
                     reasoning_effort: reasoning_effort.clone(),
+                    temperature,
                     allow_broad_cwd,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
@@ -1860,6 +1901,28 @@ fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
     loader.load().ok()?.model().map(ToOwned::to_owned)
+}
+
+fn config_temperature_for_current_dir() -> Option<f64> {
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    loader.load().ok()?.temperature()
+}
+
+fn resolve_temperature(cli_temperature: Option<f64>) -> Option<f64> {
+    if cli_temperature.is_some() {
+        return cli_temperature;
+    }
+    if let Some(env_value) = env::var("CLAW_TEMPERATURE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+    {
+        if let Some(parsed) = parse_temperature_value(&env_value).ok() {
+            return Some(parsed);
+        }
+    }
+    config_temperature_for_current_dir()
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -3686,6 +3749,7 @@ fn run_resume_command(
         }
         SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
+        | SlashCommand::Temperature { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
@@ -3826,12 +3890,14 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     reasoning_effort: Option<String>,
+    temperature: Option<f64>,
     allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
+    cli.set_temperature(temperature);
     let mention_names = cli.mention_candidates().unwrap_or_default();
     let skill_names = cli.skill_candidates().unwrap_or_default();
     let mut editor = input::LineEditor::new(
@@ -3981,6 +4047,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -4661,6 +4728,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            temperature: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4669,6 +4737,13 @@ impl LiveCli {
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
+    fn set_temperature(&mut self, temperature: Option<f64>) {
+        self.temperature = temperature;
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_temperature(temperature);
         }
     }
 
@@ -4794,7 +4869,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -4806,6 +4881,9 @@ impl LiveCli {
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut().set_temperature(self.temperature);
+        }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -5043,6 +5121,22 @@ impl LiveCli {
                     }
                 };
                 self.set_model(model)?;
+                false
+            }
+            SlashCommand::Temperature { value } => {
+                match value {
+                    Some(raw) => {
+                        let parsed = parse_temperature_value(&raw).map_err(|message| {
+                            Box::<dyn std::error::Error>::from(message)
+                        })?;
+                        self.set_temperature(Some(parsed));
+                        println!("Temperature set to {parsed}");
+                    }
+                    None => match self.temperature {
+                        Some(current) => println!("Temperature: {current}"),
+                        None => println!("Temperature: default (not set)"),
+                    },
+                }
                 false
             }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
@@ -7984,6 +8078,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    temperature: Option<f64>,
     message_cache: Option<MessageCache>,
 }
 
@@ -8051,12 +8146,17 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            temperature: None,
             message_cache: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_temperature(&mut self, temperature: Option<f64>) {
+        self.temperature = temperature;
     }
 }
 
@@ -8113,6 +8213,7 @@ impl ApiClient for AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
+            temperature: self.temperature,
             thinking: Some(ThinkingConfig {
                 config_type: "enabled".to_string(),
                 budget_tokens: Some(10000),
@@ -8687,7 +8788,6 @@ const STUB_COMMANDS: &[&str] = &[
     "language",
     "profile",
     "max-tokens",
-    "temperature",
     "system-prompt",
     "notifications",
     "telemetry",
@@ -10494,6 +10594,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10621,6 +10722,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10711,6 +10813,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10741,6 +10844,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10783,6 +10887,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10861,6 +10966,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10881,6 +10987,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10910,6 +11017,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -10936,6 +11044,7 @@ mod tests {
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -11031,6 +11140,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -11927,6 +12037,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -12000,6 +12111,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -12026,6 +12138,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -12119,6 +12232,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -12137,6 +12251,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
@@ -12165,6 +12280,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 reasoning_effort: None,
+                temperature: None,
                 allow_broad_cwd: false,
             }
         );
