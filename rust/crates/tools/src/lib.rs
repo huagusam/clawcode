@@ -3241,14 +3241,38 @@ mod tests {
 
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Tolerate transient connection resets and poll for
+                        // WouldBlock: the HTTP client (reqwest/hyper) may reset
+                        // keep-alive sockets, and on some platforms accepted
+                        // sockets inherit the listener's non-blocking mode. A
+                        // panic here cascades into the test process aborting
+                        // (Drop::join().expect() panics during unwind), so
+                        // degrade gracefully and skip unusable connections.
                         let mut buffer = [0_u8; 4096];
-                        let size = stream.read(&mut buffer).expect("read request");
+                        let mut size = 0usize;
+                        while size == 0 {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    size = n;
+                                    break;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    if rx.try_recv().is_ok() {
+                                        break;
+                                    }
+                                    thread::sleep(Duration::from_millis(2));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if size == 0 {
+                            continue;
+                        }
                         let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
                         let request_line = request.lines().next().unwrap_or_default().to_string();
                         let response = handler(&request_line);
-                        stream
-                            .write_all(response.to_bytes().as_slice())
-                            .expect("write response");
+                        let _ = stream.write_all(response.to_bytes().as_slice());
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -3275,7 +3299,11 @@ mod tests {
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                // The server thread may already have exited (e.g. it panicked on
+                // a transient connection error). Joining a panicked thread while
+                // the test itself is unwinding would itself panic and abort the
+                // whole test process, so swallow the join result.
+                let _ = handle.join();
             }
         }
     }
