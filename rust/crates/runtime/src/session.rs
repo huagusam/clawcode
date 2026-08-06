@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use crate::conversation::merge_tool_result_messages;
 use crate::image_cache::ImageCache;
 use crate::image_store::ImageStore;
 use crate::json::{JsonError, JsonValue};
@@ -460,7 +461,7 @@ impl Session {
             session_id,
             created_at_ms,
             updated_at_ms,
-            messages,
+            messages: Self::normalize_legacy_tool_messages(messages),
             compaction,
             fork,
             workspace_root,
@@ -562,7 +563,7 @@ impl Session {
             session_id: session_id.unwrap_or_else(generate_session_id),
             created_at_ms: created_at_ms.unwrap_or(now),
             updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
-            messages,
+            messages: Self::normalize_legacy_tool_messages(messages),
             compaction,
             fork,
             workspace_root,
@@ -572,6 +573,28 @@ impl Session {
             persistence: None,
             image_cache: ImageCache::new(),
         })
+    }
+
+    /// Merge consecutive tool-role messages into one. Sessions saved before the
+    /// parallel-tool-result merge fix may contain one `tool_result` message per
+    /// parallel call, which the Anthropic API rejects ("`tool_use` ids were
+    /// found without `tool_result` blocks immediately after"). Normalising on
+    /// load keeps resumed sessions wire-valid.
+    fn normalize_legacy_tool_messages(messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+        let mut result = Vec::with_capacity(messages.len());
+        for message in messages {
+            if message.role == MessageRole::Tool
+                && result
+                    .last()
+                    .is_some_and(|last: &ConversationMessage| last.role == MessageRole::Tool)
+            {
+                let last = result.pop().expect("last tool message just checked");
+                result.push(merge_tool_result_messages(vec![last, message]));
+            } else {
+                result.push(message);
+            }
+        }
+        result
     }
 
     /// Record a user prompt with the current wall-clock timestamp.
@@ -1002,11 +1025,15 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
-            Self::Thinking { signature, .. } => {
+            Self::Thinking { thinking, signature } => {
                 object.insert("type".to_string(), JsonValue::String("thinking".to_string()));
-                // Intentionally skip `thinking` field to avoid persisting large reasoning
-                // content. Only `signature` is preserved for API round-trip (Claude needs
-                // it to continue thinking context). This saves ~5000 tokens per message.
+                // Persist the thinking content so a resumed session can echo the
+                // block back to the Anthropic API verbatim (content + signature).
+                // `from_json` restores both fields; the field is optional so old
+                // session files (signature-only) still load.
+                if !thinking.is_empty() {
+                    object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
+                }
                 if let Some(sig) = signature {
                     object.insert("signature".to_string(), JsonValue::String(sig.clone()));
                 }
@@ -1700,8 +1727,79 @@ mod tests {
     }
 
     #[test]
-    fn loads_legacy_session_json_object() {
-        let path = temp_session_path("legacy");
+    fn thinking_content_round_trips_through_jsonl() {
+        let mut session = Session::new();
+        session
+            .push_user_text("think and answer")
+            .expect("user message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Thinking {
+                thinking: "reasoning text".to_string(),
+                signature: Some("sig123".to_string()),
+            }]))
+            .expect("assistant message should append");
+
+        let path = temp_session_path("thinking");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        let block = &restored.messages[1].blocks[0];
+        assert!(matches!(
+            block,
+            ContentBlock::Thinking { thinking, signature }
+                if thinking == "reasoning text" && signature.as_deref() == Some("sig123")
+        ));
+    }
+
+    #[test]
+    fn load_merges_legacy_split_tool_result_messages() {
+        let mut session = Session::new();
+        session
+            .push_user_text("do parallel tools")
+            .expect("user message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-a".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::Value::String("echo a".to_string()),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-b".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::Value::String("echo b".to_string()),
+                },
+            ]))
+            .expect("assistant message should append");
+        session
+            .push_message(ConversationMessage::tool_result("tool-a", "bash", "a", false))
+            .expect("tool result should append");
+        session
+            .push_message(ConversationMessage::tool_result("tool-b", "bash", "b", false))
+            .expect("tool result should append");
+
+        // Serialize the pre-merge layout directly: two consecutive tool messages.
+        let path = temp_session_path("legacy-tools");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        let tool_messages: Vec<_> = restored
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(
+            tool_messages.len(),
+            1,
+            "split tool results must be merged on load"
+        );
+        assert_eq!(tool_messages[0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn loads_legacy_session_json_object() {        let path = temp_session_path("legacy");
         let legacy = JsonValue::Object(
             [
                 ("version".to_string(), JsonValue::Number(1)),

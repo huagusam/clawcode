@@ -1303,10 +1303,14 @@ fn build_assistant_message(
                 };
             }
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
-            AssistantEvent::Thinking { mut text, signature } => {
+            AssistantEvent::Thinking { text: thinking_text, signature } => {
+                // Flush the OUTER accumulated text-delta content first (the
+                // binding is named `thinking_text`, not `text`, so it does not
+                // shadow the outer `text` accumulator), then insert the
+                // thinking block verbatim.
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::Thinking {
-                    thinking: text,
+                    thinking: thinking_text,
                     signature,
                 });
             }
@@ -1357,7 +1361,7 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
 /// immediately follows it; emitting one message per result breaks that pairing
 /// for parallel tool calls. `created_at` is taken from the earliest result so
 /// time-based tool-result expiry (WebSearch/WebFetch TTL) stays conservative.
-fn merge_tool_result_messages(results: Vec<ConversationMessage>) -> ConversationMessage {
+pub(crate) fn merge_tool_result_messages(results: Vec<ConversationMessage>) -> ConversationMessage {
     let mut blocks = Vec::new();
     let mut created_at = std::time::Instant::now();
     for (i, result) in results.into_iter().enumerate() {
@@ -2439,6 +2443,41 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream produced no content"));
+    }
+
+    #[test]
+    fn build_assistant_message_keeps_thinking_block_verbatim() {
+        // given — text delta before the thinking block must stay a Text block
+        // and the thinking content (with signature) must round-trip verbatim.
+        let events = vec![
+            AssistantEvent::TextDelta("Let me reason.".to_string()),
+            AssistantEvent::Thinking {
+                text: "I should check the API contract.".to_string(),
+                signature: Some("sig123".to_string()),
+            },
+            AssistantEvent::TextDelta("Now the answer.".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+
+        // when
+        let (message, _, _) = build_assistant_message(events).expect("message should build");
+
+        // then
+        assert_eq!(message.blocks.len(), 3);
+        assert!(matches!(
+            &message.blocks[0],
+            ContentBlock::Text { text } if text == "Let me reason."
+        ));
+        assert!(matches!(
+            &message.blocks[1],
+            ContentBlock::Thinking { thinking, signature }
+                if thinking == "I should check the API contract."
+                    && signature.as_deref() == Some("sig123")
+        ));
+        assert!(matches!(
+            &message.blocks[2],
+            ContentBlock::Text { text } if text == "Now the answer."
+        ));
     }
 
     #[test]
