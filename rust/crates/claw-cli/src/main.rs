@@ -7869,7 +7869,8 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             mcp_state.clone(),
             std::env::current_dir().unwrap_or_default(),
-        ),
+        )
+        .with_terminal_width(),
         policy,
         system_prompt,
         &feature_config,
@@ -8274,7 +8275,12 @@ impl AnthropicRuntimeClient {
         } else {
             &mut sink
         };
-        let renderer = TerminalRenderer::new();
+        let mut renderer = TerminalRenderer::new();
+        if let Ok((columns, _)) = crossterm::terminal::size() {
+            if columns > 0 {
+                renderer.set_max_width(columns as usize);
+            }
+        }
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
@@ -9823,6 +9829,18 @@ impl CliToolExecutor {
             call_counts: std::collections::HashMap::new(),
             workspace_root,
         }
+    }
+
+    /// Constrain table rendering in tool output to the current terminal width.
+    /// Only called on the interactive path; tests construct the executor
+    /// directly and are unaffected.
+    pub fn with_terminal_width(mut self) -> Self {
+        if let Ok((columns, _)) = crossterm::terminal::size() {
+            if columns > 0 {
+                self.renderer.set_max_width(columns as usize);
+            }
+        }
+        self
     }
 
     /// Check workspace boundary for the given path.

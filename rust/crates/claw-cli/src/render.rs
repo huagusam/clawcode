@@ -10,7 +10,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use phf::phf_map;
 
@@ -733,12 +733,9 @@ impl TerminalRenderer {
 
         let mut output = String::new();
         if !table.headers.is_empty() {
-            output.push_str(&self.render_table_row(
-                &table.headers,
-                &widths,
-                true,
-                &table.alignments,
-            ));
+            output.push_str(&self
+                .render_table_row(&table.headers, &widths, true, &table.alignments)
+                .join("\n"));
             output.push('\n');
             output.push_str(&separator);
             if !table.rows.is_empty() {
@@ -747,7 +744,7 @@ impl TerminalRenderer {
         }
 
         for (index, row) in table.rows.iter().enumerate() {
-            output.push_str(&self.render_table_row(row, &widths, false, &table.alignments));
+            output.push_str(&self.render_table_row(row, &widths, false, &table.alignments).join("\n"));
             if index + 1 < table.rows.len() {
                 output.push('\n');
             }
@@ -799,31 +796,47 @@ impl TerminalRenderer {
         widths: &[usize],
         _is_header: bool,
         alignments: &[Alignment],
-    ) -> String {
+    ) -> Vec<String> {
         let border = format!("{}", "│".with(self.color_theme.table_border));
-        let mut line = String::new();
-        line.push_str(&border);
 
+        // Wrap every cell to its column width so long content (which appears
+        // when `max_width` constrains the table) stays inside the column
+        // instead of overflowing the terminal.
+        let mut cell_lines: Vec<Vec<String>> = Vec::with_capacity(widths.len());
+        let mut max_lines = 1usize;
         for (index, width) in widths.iter().enumerate() {
             let cell = row.get(index).map_or("", String::as_str);
-            let vis_width = visible_width(cell);
-            let padding = width.saturating_sub(vis_width);
-            let align = alignments.get(index).copied().unwrap_or(Alignment::None);
-
-            let (left_pad, right_pad) = match align {
-                Alignment::Right => (padding, 0),
-                Alignment::Center => (padding / 2, padding - padding / 2),
-                _ => (0, padding),
-            };
-
-            line.push(' ');
-            line.push_str(&" ".repeat(left_pad));
-            line.push_str(cell);
-            line.push_str(&" ".repeat(right_pad + 1));
-            line.push_str(&border);
+            let lines = wrap_ansi_text(cell, *width);
+            max_lines = max_lines.max(lines.len());
+            cell_lines.push(lines);
         }
 
-        line
+        let mut rendered: Vec<String> = Vec::with_capacity(max_lines);
+        for line_index in 0..max_lines {
+            let mut line = String::new();
+            line.push_str(&border);
+            for (index, width) in widths.iter().enumerate() {
+                let text = cell_lines[index].get(line_index).map_or("", String::as_str);
+                let vis_width = visible_width(text);
+                let padding = width.saturating_sub(vis_width);
+                let align = alignments.get(index).copied().unwrap_or(Alignment::None);
+
+                let (left_pad, right_pad) = match align {
+                    Alignment::Right => (padding, 0),
+                    Alignment::Center => (padding / 2, padding - padding / 2),
+                    _ => (0, padding),
+                };
+
+                line.push(' ');
+                line.push_str(&" ".repeat(left_pad));
+                line.push_str(text);
+                line.push_str(&" ".repeat(right_pad + 1));
+                line.push_str(&border);
+            }
+            rendered.push(line);
+        }
+
+        rendered
     }
 
     #[must_use]
@@ -1309,6 +1322,115 @@ fn strip_ansi(input: &str) -> String {
     }
 
     output
+}
+
+/// Word-wrap plain (ANSI-free) text into lines of at most `width` visible
+/// columns. Over-long single words are hard-broken and CJK wide characters
+/// count as two columns.
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for paragraph in text.split('\n') {
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        for word in paragraph.split_whitespace() {
+            let word_width = word.width();
+            if current_width > 0 && current_width + 1 + word_width > width {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            if current_width == 0 && word_width > width {
+                for chunk in split_word_by_width(word, width) {
+                    if !current.is_empty() {
+                        lines.push(std::mem::take(&mut current));
+                    }
+                    current.push_str(&chunk);
+                    current_width = chunk.width();
+                }
+                continue;
+            }
+            if current_width > 0 {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(word);
+            current_width += word_width;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Break an over-long word into chunks of at most `width` visible columns.
+fn split_word_by_width(word: &str, width: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in word.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Collect the leading ANSI escape sequences of `text` (every escape before
+/// the first visible character) so styling can be re-applied after a wrap.
+fn leading_ansi_prefix(text: &str) -> String {
+    let mut prefix = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            break;
+        }
+        let mut seq = String::from('\u{1b}');
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            seq.push('[');
+            for next in chars.by_ref() {
+                seq.push(next);
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        prefix.push_str(&seq);
+    }
+    prefix
+}
+
+/// Word-wrap text that may contain ANSI escape sequences into lines of at most
+/// `width` visible columns. The leading ANSI styling is re-emitted at the
+/// start of every wrapped line so whole-cell styling survives the wrap.
+fn wrap_ansi_text(text: &str, width: usize) -> Vec<String> {
+    let prefix = leading_ansi_prefix(text);
+    let lines = wrap_plain_text(&strip_ansi(text), width);
+    if prefix.is_empty() {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .map(|line| format!("{prefix}{line}\x1b[0m"))
+        .collect()
 }
 
 /// Pre-process raw markdown so that `$...$` / `$$...$$` LaTeX fragments render
@@ -2414,8 +2536,8 @@ fn close_dangling_fence(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        close_dangling_fence, degrade_latex, escape_pipes_in_spans, strip_ansi, ColorTheme,
-        MarkdownStreamState, Spinner, TerminalRenderer,
+        close_dangling_fence, degrade_latex, escape_pipes_in_spans, strip_ansi, visible_width,
+        wrap_plain_text, ColorTheme, MarkdownStreamState, Spinner, TerminalRenderer,
     };
 
     #[test]
@@ -2496,6 +2618,54 @@ mod tests {
         assert_eq!(lines[2], "│ a     │   b    │     c │");
         assert_eq!(lines[3], "│ alpha │  beta  │ gamma │");
         assert!(markdown_output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn wrap_plain_text_wraps_words_and_breaks_long_tokens() {
+        assert_eq!(
+            wrap_plain_text("one two three", 5),
+            vec!["one", "two", "three"]
+        );
+        assert_eq!(
+            wrap_plain_text("supercalifragilistic", 6),
+            vec!["superc", "alifra", "gilist", "ic"]
+        );
+        // CJK wide characters count as two columns.
+        assert_eq!(
+            wrap_plain_text("中文测试内容", 4),
+            vec!["中文", "测试", "内容"]
+        );
+        // A single long token in a narrow column is hard-broken.
+        assert_eq!(
+            wrap_plain_text("prefix https://example.com/very/long/url suffix", 12),
+            vec!["prefix", "https://exam", "ple.com/very", "/long/url", "suffix"]
+        );
+    }
+
+    #[test]
+    fn renders_table_cells_wrapped_to_fit_terminal_width() {
+        let mut renderer = TerminalRenderer::new();
+        renderer.set_max_width(20);
+        let output = renderer.render_markdown(
+            "| Header One | Second Header |\n| :-- | :-- |\n| long value | other |",
+        );
+        let plain = strip_ansi(&output);
+        let lines: Vec<&str> = plain.lines().collect();
+        for line in &lines {
+            assert!(
+                visible_width(line) <= 20,
+                "table line exceeds max width: {line:?} ({})",
+                visible_width(line)
+            );
+        }
+        // Wrapped content must still be fully visible across lines.
+        let joined = plain;
+        for expected in ["Header", "One", "Second", "long", "value", "other"] {
+            assert!(
+                joined.contains(expected),
+                "table should contain wrapped {expected:?}: {joined:?}"
+            );
+        }
     }
 
     #[test]
@@ -2766,7 +2936,7 @@ mod tests {
 #[cfg(test)]
 mod spinner_frame_width_tests {
     use super::Spinner;
-    use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     #[test]
     fn every_spinner_frame_is_one_cell_wide() {
