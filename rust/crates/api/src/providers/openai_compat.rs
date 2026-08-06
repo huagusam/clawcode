@@ -974,8 +974,9 @@ pub fn translate_message_with_options(
                             "arguments": input.to_string(),
                         }
                     })),
-                    InputContentBlock::ToolResult { .. } => {}
-                    InputContentBlock::Image { .. } => {}
+                    InputContentBlock::ToolResult { .. }
+                    | InputContentBlock::Image { .. }
+                    | InputContentBlock::Thinking { .. } => {}
                 }
             }
             if text.is_empty() && tool_calls.is_empty() {
@@ -1031,7 +1032,8 @@ pub fn translate_message_with_options(
                             content_array.push(serde_json::Value::Object(image_block));
                         }
                     }
-                    InputContentBlock::ToolUse { .. } => {}
+                    InputContentBlock::ToolUse { .. }
+                    | InputContentBlock::Thinking { .. } => {}
                     InputContentBlock::ToolResult {
                         tool_use_id,
                         content,

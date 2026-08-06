@@ -39,17 +39,27 @@ pub fn convert_messages_inner(
             .blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Thinking { .. } => None,
+                ContentBlock::Thinking { thinking, signature } => {
+                    // Anthropic extended thinking requires thinking blocks to be
+                    // echoed back to the API (content + signature) when the
+                    // assistant turn is included in a follow-up request; the
+                    // server authenticates the `signature`. Only signed blocks
+                    // are passed back — signature-less thinking (provider
+                    // redaction placeholders, non-Anthropic reasoning models)
+                    // is dropped, matching the pre-fix behaviour.
+                    signature.clone().map(|signature| InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: Some(signature),
+                    })
+                }
                 ContentBlock::Text { text } => {
                     Some(InputContentBlock::Text { text: text.clone() })
                 }
-                ContentBlock::ToolUse { id, name, input } => {
-                    Some(InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    })
-                }
+                ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }),
                 ContentBlock::Image {
                     mime_type, data, filename, ..
                 } => {
@@ -297,5 +307,74 @@ mod tests {
         let blocks = &converted[0].content;
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], InputContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn test_thinking_block_is_preserved_for_api_round_trip() {
+        let messages = vec![make_message(vec![
+            ContentBlock::Thinking {
+                thinking: "Let me reason carefully.".to_string(),
+                signature: Some("sig123".to_string()),
+            },
+            ContentBlock::ToolUse {
+                id: "tu1".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+            },
+        ])];
+
+        let (converted, _) = convert_messages_inner(&messages, None, None, None);
+
+        let blocks = &converted[0].content;
+        assert_eq!(
+            blocks.len(),
+            2,
+            "thinking block must not be dropped; Anthropic requires it for round-trip"
+        );
+        assert!(matches!(
+            &blocks[0],
+            InputContentBlock::Thinking {
+                thinking,
+                signature,
+            } if thinking == "Let me reason carefully."
+                && signature.as_deref() == Some("sig123")
+        ));
+    }
+
+    #[test]
+    fn test_thinking_block_serializes_as_anthropic_thinking_shape() {
+        let messages = vec![make_message(vec![ContentBlock::Thinking {
+            thinking: String::new(),
+            signature: Some("sig_abc".to_string()),
+        }])];
+
+        let (converted, _) = convert_messages_inner(&messages, None, None, None);
+
+        let value = serde_json::to_value(&converted[0]).expect("message should serialize");
+        let block = &value["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["signature"], "sig_abc");
+    }
+
+    #[test]
+    fn test_signature_less_thinking_block_is_not_sent_to_api() {
+        // Signature-less thinking (redaction placeholders, non-Anthropic
+        // reasoning models) cannot be authenticated by the Anthropic API, so
+        // it must be dropped rather than emitted as a malformed thinking block.
+        let messages = vec![make_message(vec![
+            ContentBlock::Thinking {
+                thinking: "reasoning without signature".to_string(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "visible answer".to_string(),
+            },
+        ])];
+
+        let (converted, _) = convert_messages_inner(&messages, None, None, None);
+
+        let blocks = &converted[0].content;
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], InputContentBlock::Text { text } if text == "visible answer"));
     }
 }

@@ -335,6 +335,16 @@ pub enum InputContentBlock {
         #[serde(rename = "source")]
         source: ImageSource,
     },
+    Thinking {
+        /// The reasoning content returned by the model. Must be echoed back
+        /// verbatim (with `signature`) when the assistant turn is included in
+        /// a follow-up request under Anthropic extended thinking.
+        thinking: String,
+        /// Opaque signature that the Anthropic API uses to authenticate the
+        /// thinking block. Mandatory for round-tripping thinking blocks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -336,6 +336,7 @@ async fn stream_with_provider(
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut saw_stop = false;
     let mut accumulated_thinking = String::new();
+    let mut pending_thinking_signature: Option<String> = None;
     let mut block_is_thinking = false;
     // ThinkParser strips inline `<think>…</think>` tags from text deltas
     // so reasoning models that emit thinking inline (DeepSeek-R1, GLM-Z1,
@@ -352,6 +353,9 @@ async fn stream_with_provider(
                 }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
+                if matches!(start.content_block, OutputContentBlock::Thinking { .. }) {
+                    pending_thinking_signature = None;
+                }
                 let (trailing_visible, trailing_reasoning) = think_parser.finish();
                 if !trailing_visible.is_empty() {
                     events.push(AssistantEvent::TextDelta(trailing_visible));
@@ -364,7 +368,12 @@ async fn stream_with_provider(
                     OutputContentBlock::Thinking { .. }
                 );
                 if !block_is_thinking {
-                    flush_thinking_block(&mut events, &mut accumulated_thinking, progress_reporter);
+                    flush_thinking_block(
+                        &mut events,
+                        &mut accumulated_thinking,
+                        &mut pending_thinking_signature,
+                        progress_reporter,
+                    );
                 }
                 push_output_block(
                     start.content_block,
@@ -410,7 +419,9 @@ async fn stream_with_provider(
                         }
                     }
                 }
-                ContentBlockDelta::SignatureDelta { .. } => {}
+                ContentBlockDelta::SignatureDelta { signature } => {
+                    pending_thinking_signature = Some(signature);
+                }
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 let (trailing_visible, trailing_reasoning) = think_parser.finish();
@@ -421,7 +432,12 @@ async fn stream_with_provider(
                     accumulated_thinking.push_str(&trailing_reasoning);
                 }
                 if block_is_thinking || !accumulated_thinking.is_empty() {
-                    flush_thinking_block(&mut events, &mut accumulated_thinking, progress_reporter);
+                    flush_thinking_block(
+                        &mut events,
+                        &mut accumulated_thinking,
+                        &mut pending_thinking_signature,
+                        progress_reporter,
+                    );
                     block_is_thinking = false;
                     if let Some((ref agent_id, ref shared)) = progress_reporter {
                         set_current_activity(shared, agent_id, None);
@@ -446,7 +462,12 @@ async fn stream_with_provider(
                     accumulated_thinking.push_str(&trailing_reasoning);
                 }
                 if block_is_thinking || !accumulated_thinking.is_empty() {
-                    flush_thinking_block(&mut events, &mut accumulated_thinking, progress_reporter);
+                    flush_thinking_block(
+                        &mut events,
+                        &mut accumulated_thinking,
+                        &mut pending_thinking_signature,
+                        progress_reporter,
+                    );
                     block_is_thinking = false;
                 }
                 events.push(AssistantEvent::MessageStop);
@@ -507,21 +528,35 @@ fn push_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
-            if !thinking.is_empty() {
+        OutputContentBlock::Thinking { thinking, signature } => {
+            if streaming_tool_input && thinking.is_empty() {
+                // Streaming: text arrives via ThinkingDelta — do nothing yet;
+                // the deltas accumulate and are flushed at block stop.
+            } else if !thinking.is_empty() {
                 let (clean, tool_calls) = extract_embedded_tools(&thinking);
                 for (id, name, input) in tool_calls {
                     events.push(AssistantEvent::ToolUse { id, name, input });
                 }
                 if !clean.trim().is_empty() {
-                    events.push(AssistantEvent::Thinking(clean));
+                    events.push(AssistantEvent::Thinking {
+                        text: clean,
+                        signature,
+                    });
                 }
+            } else if let Some(sig) = signature {
+                // Non-streaming `display: "omitted"` block: empty text but the
+                // signature is mandatory for the tool-use round-trip — keep it.
+                events.push(AssistantEvent::Thinking {
+                    text: String::new(),
+                    signature: Some(sig),
+                });
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {
-            events.push(AssistantEvent::Thinking(
-                "[Thinking block hidden by provider]".to_string(),
-            ));
+            events.push(AssistantEvent::Thinking {
+                text: "[Thinking block hidden by provider]".to_string(),
+                signature: None,
+            });
         }
         OutputContentBlock::Image { .. } => {}
     }
@@ -570,9 +605,10 @@ fn prompt_cache_record_to_runtime_event(
 fn flush_thinking_block(
     events: &mut Vec<AssistantEvent>,
     accumulated_thinking: &mut String,
+    pending_thinking_signature: &mut Option<String>,
     progress_reporter: &Option<(String, SharedProgress)>,
 ) {
-    if accumulated_thinking.is_empty() {
+    if accumulated_thinking.is_empty() && pending_thinking_signature.is_none() {
         return;
     }
     let text = std::mem::take(accumulated_thinking);
@@ -590,8 +626,12 @@ fn flush_thinking_block(
         }
     }
 
-    if !clean.trim().is_empty() {
-        events.push(AssistantEvent::Thinking(clean));
+    let signature = pending_thinking_signature.take();
+    if !clean.trim().is_empty() || signature.is_some() {
+        events.push(AssistantEvent::Thinking {
+            text: clean,
+            signature,
+        });
     }
 }
 

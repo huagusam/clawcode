@@ -8280,6 +8280,7 @@ impl AnthropicRuntimeClient {
         let mut pending_tool: Option<(String, String, String)> = None;
         let mut block_has_thinking_summary = false;
         let mut accumulated_thinking = String::new();
+        let mut pending_thinking_signature: Option<String> = None;
         let mut last_clean_display_len: usize = 0;
         let mut saw_stop = false;
         let mut received_any_event = false;
@@ -8323,27 +8324,38 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
+                    // A new thinking block starts fresh: any signature seen
+                    // before belongs to the previous block (or is stale).
+                    if matches!(start.content_block, OutputContentBlock::Thinking { .. }) {
+                        pending_thinking_signature = None;
+                    }
                     // If a ContentBlockStart for a non-thinking block arrives
                     // while block_has_thinking_summary is still true, it means
                     // the model skipped ContentBlockStop for the thinking block.
                     // Close the open thinking ANSI sequence and reset the flag.
-                    if block_has_thinking_summary
+                    if (block_has_thinking_summary || pending_thinking_signature.is_some())
                         && !matches!(start.content_block, OutputContentBlock::Thinking { .. })
                     {
-                        write!(out, "{}", reasoning_streaming_suffix())
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if block_has_thinking_summary {
+                            write!(out, "{}", reasoning_streaming_suffix())
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         // ContentBlockStop for thinking was skipped — extract any
                         // orphaned tool calls from accumulated_thinking before clearing.
-                        if !accumulated_thinking.is_empty() {
+                        if !accumulated_thinking.is_empty() || pending_thinking_signature.is_some() {
                             let text = std::mem::take(&mut accumulated_thinking);
                             last_clean_display_len = 0;
+                            let signature = pending_thinking_signature.take();
                             let (clean, tool_calls) = extract_embedded_tools(&text);
                             for (id, name, input) in tool_calls {
                                 events.push(AssistantEvent::ToolUse { id, name, input });
                             }
-                            if !clean.trim().is_empty() {
-                                events.push(AssistantEvent::Thinking(clean));
+                            if !clean.trim().is_empty() || signature.is_some() {
+                                events.push(AssistantEvent::Thinking {
+                                    text: clean,
+                                    signature,
+                                });
                             }
                         }
                         block_has_thinking_summary = false;
@@ -8400,16 +8412,24 @@ impl AnthropicRuntimeClient {
                             }
                         }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        // Captured so the thinking block can be echoed back to the
+                        // Anthropic API with its mandatory signature on follow-ups.
+                        pending_thinking_signature = Some(signature);
+                    }
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
-                    if block_has_thinking_summary {
-                        write!(out, "{}", reasoning_streaming_suffix())
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        if !accumulated_thinking.is_empty() {
+                    if block_has_thinking_summary || pending_thinking_signature.is_some() {
+                        // Only close the ANSI sequence if thinking text was rendered.
+                        if block_has_thinking_summary {
+                            write!(out, "{}", reasoning_streaming_suffix())
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        if !accumulated_thinking.is_empty() || pending_thinking_signature.is_some() {
                             let thinking_text = std::mem::take(&mut accumulated_thinking);
                             last_clean_display_len = 0;
+                            let signature = pending_thinking_signature.take();
                             // Extract embedded tool calls from thinking XML and push as
                             // real ToolUse events. The model outputs tool calls ONLY as
                             // XML in thinking blocks — not as structured ContentBlock::ToolUse.
@@ -8417,8 +8437,8 @@ impl AnthropicRuntimeClient {
                             for (id, name, input) in tool_calls {
                                 events.push(AssistantEvent::ToolUse { id, name, input });
                             }
-                            if !clean.trim().is_empty() {
-                                events.push(AssistantEvent::Thinking(clean));
+                            if !clean.trim().is_empty() || signature.is_some() {
+                                events.push(AssistantEvent::Thinking { text: clean, signature });
                             }
                         }
                     }
@@ -8447,16 +8467,22 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
                     // Safety: close any open thinking ANSI sequence
-                    if block_has_thinking_summary {
-                        let _ = write!(out, "{}", reasoning_streaming_suffix());
-                        last_clean_display_len = 0;
-                        if !accumulated_thinking.is_empty() {
+                    if block_has_thinking_summary || pending_thinking_signature.is_some() {
+                        if block_has_thinking_summary {
+                            let _ = write!(out, "{}", reasoning_streaming_suffix());
+                            last_clean_display_len = 0;
+                        }
+                        if !accumulated_thinking.is_empty() || pending_thinking_signature.is_some() {
                             let (clean, tool_calls) = extract_embedded_tools(&accumulated_thinking);
                             for (id, name, input) in tool_calls {
                                 events.push(AssistantEvent::ToolUse { id, name, input });
                             }
-                            if !clean.trim().is_empty() {
-                                events.push(AssistantEvent::Thinking(clean));
+                            let signature = pending_thinking_signature.take();
+                            if !clean.trim().is_empty() || signature.is_some() {
+                                events.push(AssistantEvent::Thinking {
+                                    text: clean,
+                                    signature,
+                                });
                             }
                             accumulated_thinking.clear();
                         }
@@ -9641,7 +9667,7 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking { thinking, signature } => {
             if streaming_tool_input && thinking.is_empty() {
                 // Streaming: text arrives via ThinkingDelta — do nothing yet.
                 // ThinkingDelta handler will write the prefix when text arrives.
@@ -9667,7 +9693,17 @@ fn push_output_block(
                 write!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                events.push(AssistantEvent::Thinking(display_text.to_string()));
+                events.push(AssistantEvent::Thinking {
+                    text: display_text.to_string(),
+                    signature,
+                });
+            } else if let Some(sig) = signature {
+                // Non-streaming `display: "omitted"` block: empty text but the
+                // signature is mandatory for the tool-use round-trip — keep it.
+                events.push(AssistantEvent::Thinking {
+                    text: String::new(),
+                    signature: Some(sig),
+                });
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {
@@ -9678,9 +9714,10 @@ fn push_output_block(
             )
             .and_then(|()| out.flush())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-            events.push(AssistantEvent::Thinking(
-                "[Thinking block hidden by provider]".to_string(),
-            ));
+            events.push(AssistantEvent::Thinking {
+                text: "[Thinking block hidden by provider]".to_string(),
+                signature: None,
+            });
         }
         OutputContentBlock::Image {
             data, mime_type, ..
@@ -13870,7 +13907,7 @@ UU conflicted.rs",
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AssistantEvent::Thinking(_))),
+                .any(|e| matches!(e, AssistantEvent::Thinking { .. })),
             "expected a collapsed Thinking event to be surfaced: {events:?}"
         );
         let rendered = String::from_utf8(out).expect("utf8");

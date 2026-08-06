@@ -226,8 +226,13 @@ pub enum AssistantEvent {
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
     MessageStop,
-    /// Accumulated thinking content from a thinking block.
-    Thinking(String),
+    /// Accumulated thinking content from a thinking block, plus its signature
+    /// (captured from `signature_delta`) which the Anthropic API requires when
+    /// the block is echoed back on a follow-up request.
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
     // Added to handle image output events
     Image {
         data: String,
@@ -783,6 +788,12 @@ where
                 break;
             }
 
+            // Anthropic requires every tool_result responding to a tool_use
+            // turn to live in the single user message immediately following
+            // the assistant message. Emitting each result as its own message
+            // breaks that pairing for parallel tool calls (400: `tool_use`
+            // ids found without `tool_result` blocks immediately after).
+            let mut results = Vec::new();
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let input_str = match &input {
                     serde_json::Value::String(s) => s.clone(),
@@ -790,13 +801,15 @@ where
                 };
                 let result_message =
                     self.execute_one_tool_use(tool_use_id, tool_name, input_str, prompter, *iterations)?;
-                self.session
-                    .push_message(result_message.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                Arc::make_mut(api_messages).push(result_message.clone());
                 self.record_tool_finished(*iterations, &result_message);
-                tool_results.push(result_message);
+                tool_results.push(result_message.clone());
+                results.push(result_message);
             }
+            let merged = merge_tool_result_messages(results);
+            self.session
+                .push_message(merged.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            Arc::make_mut(api_messages).push(merged);
         }
         Ok(())
     }
@@ -1290,11 +1303,11 @@ fn build_assistant_message(
                 };
             }
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
-            AssistantEvent::Thinking(thinking) => {
+            AssistantEvent::Thinking { mut text, signature } => {
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::Thinking {
-                    thinking,
-                    signature: None,
+                    thinking: text,
+                    signature,
                 });
             }
             AssistantEvent::MessageStop => {
@@ -1335,6 +1348,31 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
         blocks.push(ContentBlock::Text {
             text: std::mem::take(text),
         });
+    }
+}
+
+/// Merge the tool-result messages produced for a single assistant tool_use
+/// turn into one message. The Anthropic API requires all `tool_result` blocks
+/// responding to an assistant turn to be in the single user message that
+/// immediately follows it; emitting one message per result breaks that pairing
+/// for parallel tool calls. `created_at` is taken from the earliest result so
+/// time-based tool-result expiry (WebSearch/WebFetch TTL) stays conservative.
+fn merge_tool_result_messages(results: Vec<ConversationMessage>) -> ConversationMessage {
+    let mut blocks = Vec::new();
+    let mut created_at = std::time::Instant::now();
+    for (i, result) in results.into_iter().enumerate() {
+        if i == 0 {
+            created_at = result.created_at;
+        }
+        blocks.extend(result.blocks);
+    }
+    ConversationMessage {
+        role: MessageRole::Tool,
+        blocks,
+        usage: None,
+        created_at,
+        cached_tokens: OnceLock::new(),
+        cached_input_message: OnceLock::new(),
     }
 }
 
@@ -1634,6 +1672,74 @@ mod tests {
             &summary.tool_results[0].blocks[0],
             ContentBlock::ToolResult { is_error: true, output, .. } if output == "not now"
         ));
+    }
+
+    #[test]
+    fn multiple_tool_uses_in_one_turn_merge_results_into_single_message() {
+        struct TwoToolApiClient;
+        impl ApiClient for TwoToolApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool)
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("done.".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-a".to_string(),
+                        name: "add".to_string(),
+                        input: serde_json::json!("1,1"),
+                    },
+                    AssistantEvent::ToolUse {
+                        id: "tool-b".to_string(),
+                        name: "add".to_string(),
+                        input: serde_json::json!("2,2"),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let tool_executor = StaticToolExecutor::new().register("add", |input| {
+            let total: i32 = input
+                .split(',')
+                .map(|part| part.trim().parse::<i32>().unwrap_or(0))
+                .sum();
+            Ok(total.to_string())
+        });
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TwoToolApiClient,
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("do two adds", Some(&mut PromptAllowOnce))
+            .expect("conversation loop should succeed");
+
+        // Anthropic requires every tool_result for a tool_use turn to live in
+        // the single user message immediately following the assistant message.
+        let tool_messages: Vec<_> = runtime
+            .session()
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(
+            tool_messages.len(),
+            1,
+            "both tool results must be merged into one user message"
+        );
+        assert_eq!(tool_messages[0].blocks.len(), 2);
+        assert_eq!(summary.tool_results.len(), 2);
     }
 
     #[test]

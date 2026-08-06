@@ -1,7 +1,7 @@
 //! Context management for LLM API requests.
 //!
 //! This module filters session messages before sending to the LLM:
-//! - Removes Thinking block content (preserves signature for API round-trip)
+//! - Preserves Thinking blocks verbatim (Anthropic requires them for round-trip)
 //! - Estimates token usage
 //! - Truncates messages that exceed context window
 
@@ -28,7 +28,7 @@ fn tool_result_expired(tool_name: &str, created_at: Instant, config: &Compressio
 
 /// Filters conversation messages for LLM API requests, using the global defaults.
 ///
-/// - Thinking blocks: content removed, signature preserved for API round-trip.
+/// - Thinking blocks: content + signature preserved verbatim for API round-trip.
 /// - Large ToolResult (WebFetch, read_file, new_file, edit_file, bash, grep_search):
 ///   output replaced with structured summary to avoid re-sending content that
 ///   the AI has already processed.
@@ -53,10 +53,13 @@ pub fn filter_for_api_with_config(
                 .blocks
                 .iter()
                 .map(|block| match block {
-                    ContentBlock::Thinking { signature, .. } => {
-                        // Strip thinking content, keep signature for API round-trip
+                    ContentBlock::Thinking { thinking, signature } => {
+                        // Preserve the block verbatim (content + signature).
+                        // Anthropic extended thinking requires thinking blocks to
+                        // be echoed back to the API unchanged for tool-use turns;
+                        // the server authenticates the `signature`.
                         ContentBlock::Thinking {
-                            thinking: String::new(),
+                            thinking: thinking.clone(),
                             signature: signature.clone(),
                         }
                     }
@@ -251,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_removes_thinking_content() {
+    fn filter_preserves_thinking_content_for_api_round_trip() {
         let msg = ConversationMessage {
             role: MessageRole::Assistant,
             blocks: vec![
@@ -269,7 +272,8 @@ mod tests {
         let filtered = filter_for_api(&[msg]);
         assert_eq!(filtered.len(), 1);
 
-        // Thinking block should exist but with empty content
+        // Thinking block must be preserved verbatim (content + signature)
+        // because the Anthropic API requires it for multi-turn tool use.
         let thinking_block = filtered[0]
             .blocks
             .iter()
@@ -277,7 +281,7 @@ mod tests {
         assert!(thinking_block.is_some());
 
         if let ContentBlock::Thinking { thinking, signature } = thinking_block.unwrap() {
-            assert_eq!(thinking, "");
+            assert_eq!(thinking, "Long thinking content...");
             assert_eq!(signature, &Some("sig123".to_string()));
         }
     }
