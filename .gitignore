@@ -1,0 +1,10 @@
+rust/target/
+
+# Local secrets - never commit
+claw/.env
+
+# Temporary local debugging tools
+dump_server.py
+dump_output.txt
+final_balance_mock.py
+final_repl_verify.py
