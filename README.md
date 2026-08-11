@@ -4,6 +4,41 @@ A terminal-native AI coding assistant built in Rust. Connects to Anthropic's Mes
 
 ![Terminal](terminal.png)
 
+## Project Origin
+
+This project was developed from a reset of the Claudecode project by UltraWorkers AI. Extensive work was done to make the project functional, with large-scale, wide-ranging modifications — only a small portion of the original code remains. This project holds significant value.
+
+### Crate-Level Changes vs Original
+
+**Removed crates (3):**
+
+| Crate | Description |
+|---|---|
+| `claw-analog/` | Original main binary — replaced by `claw-cli` |
+| `claw-rag-service/` | RAG retrieval service (Qdrant + embeddings) — fully removed |
+| `rusty-claude-cli/` | Old CLI layer — merged into `claw-cli` |
+
+**Added crates (4):**
+
+| Crate | Description |
+|---|---|
+| `agents/` | Agent delegation engine (spawn, discovery, persist, runtime) |
+| `claw-cli/` | New main CLI binary (icons, build.rs, config_wizard, picker, render) |
+| `migrate-patch-names/` | One-shot patch-name migration utility |
+| `plugin-types/` | Plugin shared types (config, lifecycle, MCP) |
+
+**Shared crate changes:**
+
+| Crate | Changes |
+|---|---|
+| `api/` | Added `convert.rs`, `incremental_body.rs`; `providers/` fully rewritten (anthropic, openai_compat); `error.rs` restructured |
+| `commands/` | `lib.rs` slimmed; extracted `handler.rs`, `registry.rs`, `path_extract.rs`, `plugin_agents.rs` |
+| `plugins/` | Removed bundled example hooks; added `frontmatter.rs`, `claude_settings.rs`; `lib.rs` expanded |
+| `runtime/` | **Most heavily changed** — removed 8 files (approval_tokens, g004_conformance, mcp_tool_bridge, report_schema, trident, worker_boot, etc.); added 18 new files (thinking/ module, tool_registry/ module, boundary, context, image_*, text_only_models, bash_job_object_ffi, etc.); `config.rs` significantly trimmed |
+| `tools/` | `lib.rs` massively refactored; added `excel_extract.rs`, `word_extract.rs`, `subagent_overlay.rs`; removed legacy docs and tests |
+
+**Summary:** 13 original crates → 14 crates. Net deletion of ~15,000+ lines from removed crates, ~3,000+ lines in new crates. `runtime/` and `tools/` underwent architectural-level restructuring.
+
 ## Features
 
 - **Dual Provider** — Anthropic Claude + any OpenAI-compatible endpoint (local or cloud)
