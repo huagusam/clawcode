@@ -52,7 +52,7 @@ run_local_openai.bat
 
 ### Configure
 
-Reference config lives in `claw/` — place it in the project root to .claw/ for per-project settings, or at `~/.claw/` for a global user-level config. Copy `.env.example` to `.claw/.env` and set your API key or local endpoint.
+Reference config lives in `claw/` — place the files placed in it to the project root to .claw/ for per-project settings, or at `~/.claw/` for a global user-level config. Copy `.env.example` to `.claw/.env` and set your API key or local endpoint.
 ### Text-Only Model Configuration
 
 If your LLM does not support image (multimodal) input — common for local/self-hosted models — add its exact name to `LLM_ONLY_MODEL.config`:
