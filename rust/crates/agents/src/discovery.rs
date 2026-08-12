@@ -157,20 +157,36 @@ impl AgentDiscovery {
 fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
     let mut roots = Vec::new();
 
-    let home_boundaries: Vec<PathBuf> = std::env::var_os("HOME")
+    // Home boundary for the project-ancestor walk. Collect both HOME and
+    // USERPROFILE (Windows shells set one or the other), canonicalizing each
+    // so 8.3 short names (`INCRED~1`) cannot fool the comparison. When
+    // canonicalization fails (stripped env, POSIX-style `HOME=/c/Users/x` in
+    // Git Bash, deleted profile dir), keep the *raw* path so the boundary is
+    // never silently dropped: an empty boundary would let the walk climb to
+    // the drive root and mislabel user-scope `.claw/agents` as project scope.
+    let mut home_boundaries: Vec<PathBuf> = [std::ffi::OsStr::new("HOME"), std::ffi::OsStr::new("USERPROFILE")]
         .into_iter()
-        .chain(std::env::var_os("USERPROFILE"))
-        .filter_map(|p| std::fs::canonicalize(PathBuf::from(p)).ok())
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .map(|p| strip_verbatim_prefix(p.canonicalize().unwrap_or_else(|_| p.clone())))
         .collect();
+    home_boundaries.dedup();
 
     for ancestor in cwd.ancestors() {
-        if home_boundaries.iter().any(|b| {
-            if let Ok(canon_ancestor) = std::fs::canonicalize(ancestor) {
-                b == &canon_ancestor
-            } else {
-                false
-            }
-        }) {
+        // An ancestor is at-or-above home when the (canonical) home starts
+        // with it. This stops the walk at the home itself *and* at any
+        // ancestor of home (cwd on a sibling drive, cwd at the drive root),
+        // whereas an exact-equality comparison would only stop at the exact
+        // home path and otherwise climb to the drive root.
+        let canon_ancestor = strip_verbatim_prefix(
+            ancestor
+                .canonicalize()
+                .unwrap_or_else(|_| ancestor.to_path_buf()),
+        );
+        if home_boundaries
+            .iter()
+            .any(|home| home.starts_with(&canon_ancestor))
+        {
             break;
         }
         push_unique_root(&mut roots, DefinitionSource::ProjectClaw, ancestor.join(".claw").join(leaf));
@@ -185,7 +201,9 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         push_unique_root(&mut roots, DefinitionSource::UserClaude, PathBuf::from(claude_config_dir).join(leaf));
     }
 
-    let home = home_boundaries.first().cloned();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
     if let Some(ref home) = home {
         let home = strip_verbatim_prefix(home.clone());
         push_unique_root(&mut roots, DefinitionSource::UserClaw, home.join(".claw").join(leaf));
