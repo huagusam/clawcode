@@ -973,6 +973,12 @@ pub fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, Str
          available to you. Use them to complete the delegated task when appropriate."
             .to_string(),
     );
+    prompt.push(
+        "Complete the task yourself end-to-end: you are the final executor and \
+         already have every tool you need. Use your own tools to finish the \
+         work directly."
+            .to_string(),
+    );
     Ok(prompt)
 }
 
@@ -1151,6 +1157,28 @@ mod tests {
         assert!(
             joined.contains("MCP tools") && joined.contains("plugin tools"),
             "system prompt should mention MCP/plugin tools: {joined}"
+        );
+    }
+
+    #[test]
+    fn subagent_system_prompt_guides_direct_completion() {
+        let prompt = build_agent_system_prompt("general-purpose")
+            .expect("system prompt should build");
+        let joined = prompt.join("\n");
+        let lower = joined.to_lowercase();
+        // Positive guidance instead of a bare prohibition: the sub-agent is
+        // told it is expected to complete the task itself with its own tools.
+        assert!(
+            lower.contains("complete the task yourself"),
+            "system prompt should positively instruct self-completion, got: {joined}"
+        );
+        assert!(
+            lower.contains("your own tools"),
+            "system prompt should point the sub-agent at its own tools, got: {joined}"
+        );
+        assert!(
+            !lower.contains("never call the agent tool"),
+            "guidance should be phrased positively, not as a prohibition, got: {joined}"
         );
     }
 
