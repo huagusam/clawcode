@@ -5450,6 +5450,23 @@ fn wait_for_agent(
 
     loop {
         if std::time::Instant::now() >= deadline {
+            // Timeout: signal the worker to stop at its next iteration
+            // boundary, then reap it within a short grace window. Without the
+            // signal the worker keeps executing (possibly mutating files /
+            // calling MCP tools) after the parent already gave up, so a parent
+            // retry of the Agent tool would run the same task twice
+            // concurrently.
+            handle.cancel();
+            let grace = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                match handle.try_join() {
+                    Ok(_) => break,
+                    Err(agents::TryAgain) if std::time::Instant::now() >= grace => break,
+                    Err(agents::TryAgain) => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
             return Err("agent timed out".to_string());
         }
         match handle.try_join() {

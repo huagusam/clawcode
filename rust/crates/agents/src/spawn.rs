@@ -17,6 +17,7 @@ pub struct AgentHandle {
     rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub progress: SharedProgress,
     finished: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,13 @@ impl AgentHandle {
         self.finished.load(Ordering::SeqCst)
     }
 
+    /// Signal the worker to stop at the next iteration boundary. The caller
+    /// must then reap the thread (via `try_join`) to avoid running the agent
+    /// to completion after it was told to stop.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
     #[cfg(feature = "test-utils")]
     pub fn noop(agent_id: impl Into<String>) -> Self {
         Self {
@@ -84,6 +92,7 @@ impl AgentHandle {
             rx: None,
             progress: crate::types::new_shared_progress(),
             finished: Arc::new(AtomicBool::new(true)),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -99,6 +108,7 @@ impl AgentHandle {
             rx: Some(rx),
             progress: crate::types::new_shared_progress(),
             finished: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -142,6 +152,7 @@ pub fn spawn_agent_task_with_progress(
     let subagent_type = job.manifest.subagent_type.clone().unwrap_or_default();
     let finished = Arc::new(AtomicBool::new(false));
     let finished_clone = Arc::clone(&finished);
+    let cancel = Arc::new(AtomicBool::new(false));
 
     {
         let mut guard = progress.agents.lock().unwrap_or_else(|e| e.into_inner());
@@ -162,6 +173,7 @@ pub fn spawn_agent_task_with_progress(
 
     let progress_for_job = Arc::clone(&progress);
     let agent_id_for_job = agent_id.clone();
+    let cancel_for_job = Arc::clone(&cancel);
     let thread_handle = std::thread::spawn(move || {
         let job_progress = Arc::clone(&progress_for_job);
         let job_agent_id = agent_id_for_job.clone();
@@ -169,6 +181,7 @@ pub fn spawn_agent_task_with_progress(
             job,
             progress: progress_for_job,
             agent_id: agent_id_for_job,
+            cancel: cancel_for_job,
         });
         let result = std::panic::catch_unwind(move || {
             run_agent_job_sync_with_progress(&job_with_progress)
@@ -225,6 +238,7 @@ pub fn spawn_agent_task_with_progress(
         rx: Some(rx),
         progress,
         finished,
+        cancel,
     })
 }
 
@@ -232,6 +246,7 @@ struct AgentJobWithProgress {
     job: AgentJob,
     progress: SharedProgress,
     agent_id: String,
+    cancel: Arc<AtomicBool>,
 }
 
 fn push_progress_event(shared: &SharedProgress, agent_id: &str, event: SubagentProgressEvent) {
@@ -249,7 +264,8 @@ fn run_agent_job_sync_with_progress(job: &AgentJobWithProgress) -> Result<String
             Some(Arc::clone(&job.progress)),
             Some(job.agent_id.clone()),
         )?
-        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
+        .with_cancel_signal(Arc::clone(&job.cancel));
     let summary = runtime
         .run_turn(job.job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;

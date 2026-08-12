@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -428,6 +429,10 @@ pub struct ConversationRuntime<C, T> {
     /// `$skill` / `@agent` delegation). These are auto-allowed so the
     /// delegation never blocks on an interactive permission prompt.
     forced_tool_ids: HashSet<String>,
+    /// Optional cooperative cancellation signal (e.g. a timed-out sub-agent
+    /// reap). When set, `drive_turn_loop` aborts at the next iteration
+    /// boundary instead of continuing to call the provider.
+    cancel_signal: Option<Arc<AtomicBool>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -485,6 +490,7 @@ where
             image_store,
             image_base64_cache: Arc::new(Mutex::new(HashMap::new())),
             forced_tool_ids: HashSet::new(),
+            cancel_signal: None,
         };
         // Pre-populate cache for all existing ImageRef blocks in the session
         if let Some(ref store) = runtime.image_store {
@@ -508,6 +514,12 @@ where
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancel_signal(mut self, cancel_signal: Arc<AtomicBool>) -> Self {
+        self.cancel_signal = Some(cancel_signal);
         self
     }
 
@@ -743,6 +755,15 @@ where
     ) -> Result<(), RuntimeError> {
         let mut compaction_retries = 0;
         loop {
+            if self
+                .cancel_signal
+                .as_ref()
+                .is_some_and(|signal| signal.load(Ordering::Relaxed))
+            {
+                let error = RuntimeError::new("agent cancelled");
+                self.record_turn_failed(*iterations, &error);
+                return Err(error);
+            }
             *iterations += 1;
             if *iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -1566,6 +1587,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
@@ -2753,6 +2775,51 @@ mod tests {
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
     }
+
+    #[test]
+    fn run_turn_aborts_when_cancel_signal_is_set() {
+        struct LoopingApi;
+        impl ApiClient for LoopingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::Value::String("payload".to_string()),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        // A cancelled runtime must refuse to run a turn rather than looping
+        // forever; the worker-thread reap path in `wait_for_agent` relies on
+        // this check at every iteration boundary.
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LoopingApi,
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(usize::MAX)
+        .with_cancel_signal(Arc::clone(&cancel));
+
+        let error = runtime
+            .run_turn("loop", None)
+            .expect_err("cancelled runtime should abort the turn");
+
+        assert!(
+            error.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {error}"
+        );
+    }
+
     #[test]
     fn runtime_error_identifies_balance_insufficient_messages() {
         let english = RuntimeError::new(
