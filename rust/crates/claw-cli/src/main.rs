@@ -1298,6 +1298,20 @@ fn read_agent_file_lossy(path: &std::path::Path) -> Result<String, std::io::Erro
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// Detected `@agent` mention with the data needed to spawn it deterministically
+/// via the Agent tool: the agent name, its file content (used as the sub-agent
+/// system prompt), the user request with the `@mention` stripped, and the
+/// definition's declared `model`/`mode` (from frontmatter) so the spawned
+/// sub-agent runs on the agent's configured model instead of the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionedAgent {
+    name: String,
+    content: String,
+    prompt: String,
+    model: Option<String>,
+    mode: Option<String>,
+}
+
 /// Detect an `@agent` mention anywhere in the input and gather the data needed
 /// to spawn it deterministically via the Agent tool: the agent name, its file
 /// content (used as the sub-agent system prompt), and the user request with the
@@ -1309,7 +1323,7 @@ fn read_agent_file_lossy(path: &std::path::Path) -> Result<String, std::io::Erro
 fn detect_mentioned_agent(
     trimmed: &str,
     agents: &[commands::AgentSummary],
-) -> Option<(String, String, String)> {
+) -> Option<MentionedAgent> {
     let mention_token = trimmed.split_whitespace().find(|t| t.starts_with('@'))?;
     let raw = mention_token.strip_prefix('@')?;
     let name = raw
@@ -1325,24 +1339,46 @@ fn detect_mentioned_agent(
         return None;
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    let content = if agents.iter().any(|a| a.name() == name) {
-        find_agent_file(&cwd, &name)
-            .and_then(|p| read_agent_file_lossy(&p).ok())
-            .or_else(|| {
-                agents
-                    .iter()
-                    .find(|a| a.name() == name)
-                    .and_then(|a| a.description().map(String::from))
-            })
+    let matched = agents.iter().find(|a| a.name() == name);
+    let (content, model, mode) = if let Some(agent) = matched {
+        let file = find_agent_file(&cwd, &name).and_then(|p| read_agent_file_lossy(&p).ok());
+        match file {
+            Some(file_content) => {
+                let (model, mode) = agent_frontmatter_model_mode(&file_content);
+                (file_content, model, mode)
+            }
+            None => (
+                agent.description().unwrap_or_default().to_string(),
+                agent.model.clone(),
+                agent.mode.clone(),
+            ),
+        }
     } else {
-        find_agent_file(&cwd, &name).and_then(|p| read_agent_file_lossy(&p).ok())
+        let file = find_agent_file(&cwd, &name).and_then(|p| read_agent_file_lossy(&p).ok())?;
+        let (model, mode) = agent_frontmatter_model_mode(&file);
+        (file, model, mode)
     };
     let content = match content {
-        Some(c) if !c.trim().is_empty() => c,
+        content if !content.trim().is_empty() => content,
         _ => return None,
     };
     let stripped = trimmed.replacen(mention_token, "", 1).trim().to_string();
-    Some((name, content, stripped))
+    Some(MentionedAgent {
+        name,
+        content,
+        prompt: stripped,
+        model,
+        mode,
+    })
+}
+
+/// Extract declared `model`/`mode` from an agent file's frontmatter, falling
+/// back to `(None, None)` when the file has no (parseable) frontmatter.
+fn agent_frontmatter_model_mode(contents: &str) -> (Option<String>, Option<String>) {
+    match plugins::frontmatter::parse_frontmatter(contents) {
+        Ok(parsed) => (parsed.frontmatter.model, parsed.frontmatter.mode),
+        Err(_) => (None, None),
+    }
 }
 
 /// Build a hint block that instructs the LLM to invoke the Agent tool for
@@ -3983,19 +4019,19 @@ fn run_repl(
                 // Deterministic `@agent` delegation: spawn the mentioned agent via the
                 // real Agent tool, forwarding its file content as the sub-agent system
                 // prompt so its persona is preserved.
-                if let Some((agent_name, agent_content, agent_prompt)) =
-                    detect_mentioned_agent(&trimmed, &plugin_agents)
-                {
-                    if agent_prompt.trim().is_empty() {
-                        eprintln!("Provide a task for @{}", agent_name);
+                if let Some(mentioned) = detect_mentioned_agent(&trimmed, &plugin_agents) {
+                    if mentioned.prompt.trim().is_empty() {
+                        eprintln!("Provide a task for @{}", mentioned.name);
                         continue;
                     }
                     let tool_input = json!({
-                        "name": agent_name,
-                        "description": agent_name,
-                        "prompt": agent_prompt,
+                        "name": mentioned.name,
+                        "description": mentioned.name,
+                        "prompt": mentioned.prompt,
                         "subagent_type": "general-purpose",
-                        "system_prompt": [agent_content],
+                        "system_prompt": [mentioned.content],
+                        "model": mentioned.model,
+                        "mode": mentioned.mode,
                     })
                     .to_string();
                     editor.push_history(input);
@@ -10494,6 +10530,7 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         apply_red_if, classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
+        detect_mentioned_agent, MentionedAgent,
         render_error_red, EXIT_INTERNAL_ERROR,
         describe_tool_progress, filter_tool_specs, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
@@ -12406,6 +12443,27 @@ mod tests {
         assert!(error.contains("claw --resume SESSION.jsonl /status"));
         });
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn detect_mentioned_agent_forwards_declared_model_and_mode() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let agents_dir = root.join(".claw").join("agents");
+        fs::create_dir_all(&agents_dir).expect("agents dir should exist");
+        fs::write(
+            agents_dir.join("helper.md"),
+            "---\nname: helper\ndescription: helper agent\nmodel: claude-sonnet-4\nmode: compact\n---\n\nYou are the helper agent.\n",
+        )
+        .expect("agent file should write");
+        with_current_dir(&root, || {
+            let mentioned: MentionedAgent = detect_mentioned_agent("@helper summarize the repo", &[])
+                .expect("mention should resolve to the helper agent");
+            assert_eq!(mentioned.name, "helper");
+            assert_eq!(mentioned.model.as_deref(), Some("claude-sonnet-4"));
+            assert_eq!(mentioned.mode.as_deref(), Some("compact"));
+        });
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
