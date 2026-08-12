@@ -8680,6 +8680,42 @@ fn format_balance_insufficient_notice() -> String {
         .to_string()
 }
 
+/// Distinct exit code for uncaught/unexpected internal failures
+/// (sysexits EX_SOFTWARE = 70). Signals a program bug, not a user mistake,
+/// and is distinct from the normal error exit(1) and usage exit(2).
+const EXIT_INTERNAL_ERROR: i32 = 70;
+
+/// Apply red ANSI styling when `red` is set. Kept as a separate function so the
+/// color decision is unit-testable without a real TTY.
+fn apply_red_if(message: &str, red: bool) -> String {
+    if red {
+        format!("\x1b[31m{message}\x1b[0m")
+    } else {
+        message.to_string()
+    }
+}
+
+/// Render a message in red, but only when stderr is a terminal. Piped or
+/// redirected output stays plain so ANSI escapes never pollute logs or
+/// machine-parsed streams.
+fn render_error_red(message: &str) -> String {
+    apply_red_if(message, io::stderr().is_terminal())
+}
+
+/// Print a red error line to stderr (respects TTY detection).
+fn eprint_red_error(message: &str) {
+    eprintln!("{}", render_error_red(message));
+}
+
+/// Internal invariant violated: print a red "internal error" line and exit
+/// with EXIT_INTERNAL_ERROR. Used at unreachable-invariant panic sites where
+/// continuing would be wrong but a Rust panic (raw thread message + backtrace
+/// noise) is not the desired terminal experience.
+fn internal_error(message: &str) -> ! {
+    eprint_red_error(&format!("internal error: {message}"));
+    std::process::exit(EXIT_INTERNAL_ERROR);
+}
+
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {    if error.is_context_window_failure() {
         format_context_window_blocked_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
@@ -10450,7 +10486,7 @@ mod tests {
 
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
+        apply_red_if, classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
         describe_tool_progress, filter_tool_specs, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
@@ -14427,9 +14463,16 @@ UU conflicted.rs",
             let with_slash = format!("/{stub}");
             assert!(
                 !candidates.contains(&with_slash),
-                "stub command {with_slash} should not appear in REPL completions"
+                "stub command {stub} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn apply_red_if_wraps_when_enabled_and_plain_when_disabled() {
+        let text = "boom";
+        assert_eq!(apply_red_if(text, true), "\x1b[31mboom\x1b[0m");
+        assert_eq!(apply_red_if(text, false), "boom");
     }
 }
 
