@@ -1310,6 +1310,7 @@ struct MentionedAgent {
     prompt: String,
     model: Option<String>,
     mode: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 /// Detect an `@agent` mention anywhere in the input and gather the data needed
@@ -1340,23 +1341,25 @@ fn detect_mentioned_agent(
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     let matched = agents.iter().find(|a| a.name() == name);
-    let (content, model, mode) = if let Some(agent) = matched {
+    let (content, model, mode, reasoning_effort) = if let Some(agent) = matched {
         let file = find_agent_file(&cwd, &name).and_then(|p| read_agent_file_lossy(&p).ok());
         match file {
             Some(file_content) => {
-                let (model, mode) = agent_frontmatter_model_mode(&file_content);
-                (file_content, model, mode)
+                let (model, mode, reasoning_effort) =
+                    agent_frontmatter_model_mode(&file_content);
+                (file_content, model, mode, reasoning_effort)
             }
             None => (
                 agent.description().unwrap_or_default().to_string(),
                 agent.model.clone(),
                 agent.mode.clone(),
+                agent.reasoning_effort.clone(),
             ),
         }
     } else {
         let file = find_agent_file(&cwd, &name).and_then(|p| read_agent_file_lossy(&p).ok())?;
-        let (model, mode) = agent_frontmatter_model_mode(&file);
-        (file, model, mode)
+        let (model, mode, reasoning_effort) = agent_frontmatter_model_mode(&file);
+        (file, model, mode, reasoning_effort)
     };
     let content = match content {
         content if !content.trim().is_empty() => content,
@@ -1369,15 +1372,23 @@ fn detect_mentioned_agent(
         prompt: stripped,
         model,
         mode,
+        reasoning_effort,
     })
 }
 
-/// Extract declared `model`/`mode` from an agent file's frontmatter, falling
-/// back to `(None, None)` when the file has no (parseable) frontmatter.
-fn agent_frontmatter_model_mode(contents: &str) -> (Option<String>, Option<String>) {
+/// Extract declared `model`/`mode`/`reasoning_effort` from an agent file's
+/// frontmatter, falling back to `(None, None, None)` when the file has no
+/// (parseable) frontmatter.
+fn agent_frontmatter_model_mode(
+    contents: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
     match plugins::frontmatter::parse_frontmatter(contents) {
-        Ok(parsed) => (parsed.frontmatter.model, parsed.frontmatter.mode),
-        Err(_) => (None, None),
+        Ok(parsed) => (
+            parsed.frontmatter.model,
+            parsed.frontmatter.mode,
+            parsed.frontmatter.reasoning_effort,
+        ),
+        Err(_) => (None, None, None),
     }
 }
 
@@ -4032,6 +4043,7 @@ fn run_repl(
                         "system_prompt": [mentioned.content],
                         "model": mentioned.model,
                         "mode": mentioned.mode,
+                        "reasoning_effort": mentioned.reasoning_effort,
                     })
                     .to_string();
                     editor.push_history(input);
@@ -12453,7 +12465,7 @@ mod tests {
         fs::create_dir_all(&agents_dir).expect("agents dir should exist");
         fs::write(
             agents_dir.join("helper.md"),
-            "---\nname: helper\ndescription: helper agent\nmodel: claude-sonnet-4\nmode: compact\n---\n\nYou are the helper agent.\n",
+            "---\nname: helper\ndescription: helper agent\nmodel: claude-sonnet-4\nmode: compact\nreasoning_effort: high\n---\n\nYou are the helper agent.\n",
         )
         .expect("agent file should write");
         with_current_dir(&root, || {
@@ -12462,6 +12474,7 @@ mod tests {
             assert_eq!(mentioned.name, "helper");
             assert_eq!(mentioned.model.as_deref(), Some("claude-sonnet-4"));
             assert_eq!(mentioned.mode.as_deref(), Some("compact"));
+            assert_eq!(mentioned.reasoning_effort.as_deref(), Some("high"));
         });
         fs::remove_dir_all(root).ok();
     }

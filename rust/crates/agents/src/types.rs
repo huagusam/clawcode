@@ -124,6 +124,8 @@ pub struct AgentOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -141,6 +143,7 @@ pub struct AgentJob {
     pub prompt: String,
     pub system_prompt: Vec<String>,
     pub allowed_tools: BTreeSet<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,4 +165,10 @@ pub struct AgentInput {
     pub allowed_tools: Option<BTreeSet<String>>,
     #[serde(default)]
     pub mode: Option<String>,
+    /// Optional reasoning-effort level (e.g. `low`/`medium`/`high`) forwarded
+    /// to the provider's `MessageRequest`. When present, the spawned sub-agent
+    /// runs with the agent definition's configured effort instead of the
+    /// provider default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }

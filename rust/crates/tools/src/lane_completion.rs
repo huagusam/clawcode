@@ -96,6 +96,7 @@ mod tests {
             subagent_type: None,
             model: None,
             mode: None,
+            reasoning_effort: None,
             status: Some("completed".to_string()),
             error: None,
             started_at: Some(1704067200),

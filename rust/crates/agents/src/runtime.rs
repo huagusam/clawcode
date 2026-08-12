@@ -119,6 +119,7 @@ pub struct ProviderRuntimeClient {
     allowed_tools: BTreeSet<String>,
     message_cache: Option<MessageCache>,
     progress: Option<(String, SharedProgress)>,
+    reasoning_effort: Option<String>,
 }
 
 impl ProviderRuntimeClient {
@@ -149,11 +150,19 @@ impl ProviderRuntimeClient {
             allowed_tools,
             message_cache: None,
             progress: None,
+            reasoning_effort: None,
         })
     }
 
+    #[must_use]
     pub fn with_progress(mut self, agent_id: String, progress: SharedProgress) -> Self {
         self.progress = Some((agent_id, progress));
+        self
+    }
+
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
         self
     }
 }
@@ -286,6 +295,7 @@ impl ApiClient for ProviderRuntimeClient {
                 cached_message_values: Arc::clone(&cached_values),
                 skip_tools,
                 tools_in_system_prompt,
+                reasoning_effort: self.reasoning_effort.clone(),
                 ..Default::default()
             };
 
@@ -993,7 +1003,8 @@ pub fn build_agent_runtime_inner(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let mut api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let mut api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?
+        .with_reasoning_effort(job.reasoning_effort.clone());
     let permission_policy = agent_permission_policy();
     let mut tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_permission_policy(permission_policy.clone());

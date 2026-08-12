@@ -2839,6 +2839,7 @@ mod tests {
                 system_prompt: None,
                 allowed_tools: None,
                 mode: None,
+                reasoning_effort: None,
             },
             move |job| {
                 let agent_id = job.manifest.agent_id.clone();
@@ -2872,6 +2873,7 @@ mod tests {
                 system_prompt: None,
                 allowed_tools: None,
                 mode: None,
+                reasoning_effort: None,
             },
             |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
         )
@@ -2888,12 +2890,49 @@ mod tests {
                 system_prompt: None,
                 allowed_tools: None,
                 mode: None,
+                reasoning_effort: None,
             },
             |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
         )
         .expect("Agent should normalize explicit names");
         assert_eq!(named_output.name, "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_reasoning_effort_flows_into_manifest_and_job() {
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+
+        let (manifest, _handle) = execute_agent_with_spawn(
+            AgentInput {
+                description: "Effort test".to_string(),
+                prompt: "Deep dive.".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("effort-agent".to_string()),
+                model: None,
+                system_prompt: None,
+                allowed_tools: None,
+                mode: None,
+                reasoning_effort: Some("high".to_string()),
+            },
+            move |job| {
+                let agent_id = job.manifest.agent_id.clone();
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                Ok(AgentHandle::noop(agent_id))
+            },
+        )
+        .expect("Agent should succeed");
+
+        assert_eq!(manifest.reasoning_effort.as_deref(), Some("high"));
+        let captured_job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("spawn job should be captured");
+        assert_eq!(captured_job.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -2923,6 +2962,7 @@ mod tests {
                 system_prompt: None,
                 allowed_tools: None,
                 mode: None,
+                reasoning_effort: None,
             },
             move |job| {
                 let agent_id = job.manifest.agent_id.clone();
@@ -2959,6 +2999,7 @@ mod tests {
                 system_prompt: None,
                 allowed_tools: None,
                 mode: None,
+                reasoning_effort: None,
             },
             move |job| {
                 let agent_id = job.manifest.agent_id.clone();
@@ -5372,6 +5413,7 @@ where
         subagent_type: normalized_subagent.clone(),
         model: Some(resolve_agent_model(input.model.as_deref())),
         mode: input.mode.clone(),
+        reasoning_effort: input.reasoning_effort.clone(),
         status: Some("Running".to_string()),
         error: None,
         started_at: Some(now),
@@ -5384,6 +5426,7 @@ where
     let job = agents::AgentJob {
         manifest,
         prompt: input.prompt,
+        reasoning_effort: input.reasoning_effort,
         system_prompt: {
             let mut base = build_agent_system_prompt(lookup_subagent).unwrap_or_default();
             match input.system_prompt {
