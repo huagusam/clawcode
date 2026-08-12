@@ -14,7 +14,8 @@ pub use self::discovery::{
 };
 pub use self::normalize::{allowed_tools_for_subagent, normalize_subagent_type, SubagentKind};
 pub use self::persist::{
-    extract_commit_sha, make_agent_id, slugify_agent_name,
+    extract_commit_sha, make_agent_id, slugify_agent_name, DEFAULT_AGENT_MAX_ITERATIONS,
+    DEFAULT_AGENT_TIMEOUT_SECS,
 };
 pub use self::runtime::{
     build_agent_runtime, build_agent_runtime_inner, build_agent_system_prompt,

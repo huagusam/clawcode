@@ -3723,6 +3723,40 @@ mod tests {
         assert!(result.unwrap_err().contains("timed out"));
     }
 
+    #[test]
+    fn agent_handle_join_reaps_thread_on_error_path() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = Arc::clone(&finished);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let thread_handle = std::thread::spawn(move || {
+            let _ = tx.send(Err("boom".to_string()));
+            finished_clone.store(true, Ordering::SeqCst);
+        });
+        let handle = AgentHandle::with_parts("test", thread_handle, rx);
+        assert!(handle.join().is_err());
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "worker thread must be reaped (joined) even on the error path"
+        );
+    }
+
+    #[test]
+    fn wait_for_agent_returns_timeout_when_deadline_passes() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let thread_handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = tx.send(Ok("done".to_string()));
+        });
+        let mut handle = AgentHandle::with_parts("test", thread_handle, rx);
+        let result =
+            super::wait_for_agent(&mut handle, std::time::Instant::now() + Duration::from_millis(30));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+        // Reap the worker so the test process does not leak a thread.
+        let _ = handle.join();
+    }
+
 }
 
 // =====================================================================
@@ -5393,6 +5427,21 @@ fn run_agent(input: agents::AgentInput) -> Result<String, String> {
         spawn_agent_task_with_progress(job, progress_clone)
     })?;
 
+    wait_for_agent(
+        &mut handle,
+        std::time::Instant::now()
+            + std::time::Duration::from_secs(agents::DEFAULT_AGENT_TIMEOUT_SECS),
+    )
+}
+
+/// Poll the subagent handle until it produces a result or `deadline` passes.
+/// The deadline guarantees a hung subagent (whose network reads are now
+/// time-bounded by the api crate) cannot hang the parent model turn forever;
+/// on expiry we return a timeout error and the handle drop reaps the worker.
+fn wait_for_agent(
+    handle: &mut agents::AgentHandle,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
     let term_width = detect_terminal_width();
     use std::sync::atomic::Ordering;
 
@@ -5400,6 +5449,9 @@ fn run_agent(input: agents::AgentInput) -> Result<String, String> {
     let mut last_lines = 0usize;
 
     loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("agent timed out".to_string());
+        }
         match handle.try_join() {
             Ok(result) => {
                 let guard = handle.progress.agents.lock().unwrap_or_else(|e| e.into_inner());
@@ -5418,7 +5470,12 @@ fn run_agent(input: agents::AgentInput) -> Result<String, String> {
                         )
                     });
                     if any_active {
-                        subagent_overlay::render_subagent_inline(&guard, term_width, &mut last_lines).ok();
+                        subagent_overlay::render_subagent_inline(
+                            &guard,
+                            term_width,
+                            &mut last_lines,
+                        )
+                        .ok();
                     }
                     drop(guard);
                 }

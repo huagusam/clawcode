@@ -43,9 +43,10 @@ impl AgentHandle {
         };
         self.finished.store(true, Ordering::SeqCst);
         remove_progress_entry(&self.progress, &self.agent_id);
-        if result.is_ok() {
-            let _ = self.thread_handle.take().map(|h| h.join());
-        }
+        // Join unconditionally on every exit path. The worker's provider calls
+        // are now time-bounded (api crate), so join() always terminates and a
+        // timed-out or failed agent never leaks its OS thread.
+        let _ = self.thread_handle.take().map(|h| h.join());
         result
     }
 
@@ -57,11 +58,15 @@ impl AgentHandle {
         match rx.try_recv() {
             Ok(result) => {
                 self.finished.store(true, Ordering::SeqCst);
+                // The worker sent its result as the final act before exiting;
+                // reap it now so the thread never leaks.
+                let _ = self.thread_handle.take().map(|h| h.join());
                 Ok(result)
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => Err(TryAgain),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.finished.store(true, Ordering::SeqCst);
+                let _ = self.thread_handle.take().map(|h| h.join());
                 Ok(Err("agent disconnected".to_string()))
             }
         }
