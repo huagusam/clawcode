@@ -355,7 +355,10 @@ fn full_convert_and_cache(
     msg_len: usize,
     model_name: Option<&str>,
 ) -> (Arc<Vec<InputMessage>>, Arc<Vec<Option<Value>>>) {
-    let image_cache = request.image_cache.as_ref().map(|arc| arc.lock().unwrap());
+    let image_cache = request
+        .image_cache
+        .as_ref()
+        .map(|arc| arc.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     let image_store = request.image_store.as_ref();
     let (msgs_arc, vals) = convert_messages_cached(
         &request.messages,
@@ -397,6 +400,10 @@ async fn stream_with_provider(
     // some Qwen variants) don't leak the thinking into the visible
     // content stream.
     let mut think_parser = ThinkParser::new();
+    // Number of content blocks that have STARTED but not yet STOPPED. A stream
+    // that reaches EOF with this > 0 was truncated mid-block, so a synthetic
+    // MessageStop would falsely mark a partial response as complete.
+    let mut open_blocks = 0usize;
 
     while let Some(event) = stream.next_event().await? {
         match event {
@@ -407,6 +414,7 @@ async fn stream_with_provider(
                 }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
+                open_blocks += 1;
                 if matches!(start.content_block, OutputContentBlock::Thinking { .. }) {
                     pending_thinking_signature = None;
                 }
@@ -488,6 +496,7 @@ async fn stream_with_provider(
                 }
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
+                open_blocks = open_blocks.saturating_sub(1);
                 let (trailing_visible, trailing_reasoning) = think_parser.finish();
                 if !trailing_visible.is_empty() {
                     accumulated_visible.push_str(&trailing_visible);
@@ -539,21 +548,17 @@ async fn stream_with_provider(
                     block_is_thinking = false;
                 }
                 flush_visible_text(&mut events, &mut accumulated_visible);
+                // A tool block may still be streaming when message_stop arrives
+                // (max_tokens cut mid-call, or the stop frame racing the final
+                // content_block_stop). Flush it rather than silently dropping
+                // the call; drain_pending_tools keeps the raw fallback.
+                drain_pending_tools(&mut events, &mut pending_tools);
                 events.push(AssistantEvent::MessageStop);
             }
         }
     }
 
     push_prompt_cache_record(client, &mut events);
-
-    if !saw_stop
-        && events.iter().any(|event| {
-            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                || matches!(event, AssistantEvent::ToolUse { .. })
-        })
-    {
-        events.push(AssistantEvent::MessageStop);
-    }
 
     if events
         .iter()
@@ -562,6 +567,21 @@ async fn stream_with_provider(
         return Ok(events);
     }
 
+    // EOF without a real message_stop. Only a provably complete stream may be
+    // synthesized into a successful completion; a truncated stream (open
+    // blocks or in-flight tools) falls through to the non-streaming retry.
+    let has_content = events.iter().any(|event| {
+        matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+            || matches!(event, AssistantEvent::ToolUse { .. })
+    });
+    if should_synthesize_stop(saw_stop, has_content, open_blocks, pending_tools.is_empty()) {
+        events.push(AssistantEvent::MessageStop);
+        return Ok(events);
+    }
+
+    // Truncated or empty stream: recover via a complete non-streaming request.
+    // If that also fails, the error propagates instead of completing silently
+    // with partial output.
     let response = client
         .send_message(&MessageRequest {
             stream: false,
@@ -571,6 +591,40 @@ async fn stream_with_provider(
     let mut events = response_to_events(response);
     push_prompt_cache_record(client, &mut events);
     Ok(events)
+}
+
+/// Decide whether an EOF without a real `message_stop` frame should be
+/// presented as a complete assistant message. Only a provably complete stream
+/// (every started block stopped, no tool block still streaming, and at least
+/// one piece of content) may be synthesized; anything else is truncation and
+/// must go through the non-streaming retry.
+fn should_synthesize_stop(
+    saw_stop: bool,
+    has_content: bool,
+    open_blocks: usize,
+    pending_tools_empty: bool,
+) -> bool {
+    !saw_stop && has_content && open_blocks == 0 && pending_tools_empty
+}
+
+/// Flush in-flight tool blocks into `ToolUse` events. Mirrors the
+/// `ContentBlockStop` fallback: when the accumulated JSON never parsed
+/// completely, the raw text is wrapped in `{"raw": ...}` so the tool still
+/// reaches the agent loop instead of being silently dropped.
+fn drain_pending_tools(
+    events: &mut Vec<AssistantEvent>,
+    pending_tools: &mut BTreeMap<u32, (String, String, String)>,
+) {
+    let drained = std::mem::take(pending_tools);
+    for (_index, (_id, name, input)) in drained {
+        let input =
+            serde_json::from_str(&input).unwrap_or_else(|_| serde_json::json!({ "raw": input }));
+        events.push(AssistantEvent::ToolUse {
+            id: _id,
+            name,
+            input,
+        });
+    }
 }
 
 fn push_output_block(
@@ -1087,5 +1141,61 @@ mod tests {
             joined.contains("MCP tools") && joined.contains("plugin tools"),
             "system prompt should mention MCP/plugin tools: {joined}"
         );
+    }
+
+    #[test]
+    fn should_synthesize_stop_requires_a_provably_complete_stream() {
+        use super::should_synthesize_stop;
+        // A real message_stop arrived — the arm already pushed it; never synth.
+        assert!(!should_synthesize_stop(true, true, 0, true));
+        // EOF with no content at all → non-streaming retry.
+        assert!(!should_synthesize_stop(false, false, 0, true));
+        // EOF mid-block (open block counter > 0) → truncation, no synth.
+        assert!(!should_synthesize_stop(false, true, 1, true));
+        // EOF with an in-flight tool block → truncation, no synth.
+        assert!(!should_synthesize_stop(false, true, 0, false));
+        // EOF, clean, with content → synthesize the missing stop.
+        assert!(should_synthesize_stop(false, true, 0, true));
+    }
+
+    #[test]
+    fn drain_pending_tools_emits_tool_use_with_raw_fallback() {
+        let mut events = Vec::new();
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            0,
+            (
+                "toolu_a".to_string(),
+                "bash".to_string(),
+                "{\"command\"".to_string(),
+            ),
+        );
+        pending.insert(
+            1,
+            (
+                "toolu_b".to_string(),
+                "read_file".to_string(),
+                "{\"path\":\"x\"}".to_string(),
+            ),
+        );
+        super::drain_pending_tools(&mut events, &mut pending);
+        assert!(pending.is_empty(), "pending tools must be drained");
+        let mut names = Vec::new();
+        for event in &events {
+            if let AssistantEvent::ToolUse { name, input, .. } = event {
+                names.push(name.as_str());
+                if name == "bash" {
+                    assert_eq!(
+                        input,
+                        &json!({ "raw": "{\"command\"" }),
+                        "unparseable partial JSON must fall back to raw"
+                    );
+                }
+                if name == "read_file" {
+                    assert_eq!(input, &json!({ "path": "x" }));
+                }
+            }
+        }
+        assert_eq!(names, vec!["bash", "read_file"]);
     }
 }
