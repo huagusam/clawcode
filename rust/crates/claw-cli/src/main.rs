@@ -1340,9 +1340,16 @@ fn detect_mentioned_agent(
         return None;
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    let matched = agents.iter().find(|a| a.name() == name);
+    let matched = agents
+        .iter()
+        .find(|a| a.name().eq_ignore_ascii_case(&name));
+    // Use the definition's canonical name (frontmatter `name:`), not the raw
+    // mention casing, so the spawned agent's manifest and hint carry the
+    // declared identity even when the user typed `@HELPER`.
+    let resolved_name = matched.map_or_else(|| name.clone(), |a| a.name().to_string());
     let (content, model, mode, reasoning_effort) = if let Some(agent) = matched {
-        let file = find_agent_file(&cwd, &name).and_then(|p| read_agent_file_lossy(&p).ok());
+        let file = find_agent_file(&cwd, &resolved_name)
+            .and_then(|p| read_agent_file_lossy(&p).ok());
         match file {
             Some(file_content) => {
                 let (model, mode, reasoning_effort) =
@@ -1357,7 +1364,8 @@ fn detect_mentioned_agent(
             ),
         }
     } else {
-        let file = find_agent_file(&cwd, &name).and_then(|p| read_agent_file_lossy(&p).ok())?;
+        let file = find_agent_file(&cwd, &resolved_name)
+            .and_then(|p| read_agent_file_lossy(&p).ok())?;
         let (model, mode, reasoning_effort) = agent_frontmatter_model_mode(&file);
         (file, model, mode, reasoning_effort)
     };
@@ -1367,7 +1375,7 @@ fn detect_mentioned_agent(
     };
     let stripped = trimmed.replacen(mention_token, "", 1).trim().to_string();
     Some(MentionedAgent {
-        name,
+        name: resolved_name,
         content,
         prompt: stripped,
         model,
@@ -1438,7 +1446,10 @@ fn resolve_mentions(input: &str, agents: &[commands::AgentSummary]) -> String {
 
     for mention in mentions {
         // Priority 1: Agent from plugin registry
-        if let Some(agent) = agents.iter().find(|a| a.name() == mention) {
+        if let Some(agent) = agents
+            .iter()
+            .find(|a| a.name().eq_ignore_ascii_case(&mention))
+        {
             let expansion = if let Some(agent_path) = find_agent_file(&cwd, &mention) {
                 match read_agent_file_lossy(&agent_path) {
                     Ok(content) => {
@@ -1501,13 +1512,44 @@ fn resolve_mentions(input: &str, agents: &[commands::AgentSummary]) -> String {
 
 /// Find an agent file by name. Searches `.claw/agents/` then `.claude/agents/`.
 /// Only supports `name.md` single-file format (no directory/SKILL.md).
+/// Matching is case-insensitive on the file stem so `@Helper` resolves a
+/// `helper.md` definition on case-sensitive filesystems (NTFS/APFS already
+/// match by themselves, but Linux/macOS do not).
 fn find_agent_file(cwd: &Path, name: &str) -> Option<PathBuf> {
     let roots = commands::discover_agent_roots(cwd);
     for dir in &roots {
+        // Fast path: exact-case join, no directory scan.
         for ext in &["md", "txt", "toml"] {
             let candidate = dir.join(format!("{}.{}", name, ext));
             if candidate.is_file() {
                 return Some(candidate);
+            }
+        }
+        // Slow path: scan the directory for a case-insensitive file-stem match.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string())
+                else {
+                    continue;
+                };
+                if stem.eq_ignore_ascii_case(name) {
+                    // The directory may hold e.g. `foo.md` and `foo.txt`; the
+                    // fast path already preferred the exact-case file, so any
+                    // case-insensitive hit here is the definition we want.
+                    let ext_ok = path.extension().is_some_and(|ext| {
+                        matches!(
+                            ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                            "md" | "txt" | "toml"
+                        )
+                    });
+                    if ext_ok {
+                        return Some(path);
+                    }
+                }
             }
         }
     }
@@ -10542,7 +10584,7 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         apply_red_if, classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
-        detect_mentioned_agent, MentionedAgent,
+        detect_mentioned_agent, MentionedAgent, find_agent_file,
         render_error_red, EXIT_INTERNAL_ERROR,
         describe_tool_progress, filter_tool_specs, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
@@ -12475,6 +12517,49 @@ mod tests {
             assert_eq!(mentioned.model.as_deref(), Some("claude-sonnet-4"));
             assert_eq!(mentioned.mode.as_deref(), Some("compact"));
             assert_eq!(mentioned.reasoning_effort.as_deref(), Some("high"));
+        });
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn detect_mentioned_agent_matches_plugin_names_case_insensitively() {
+        let _guard = env_lock();
+        let agent = commands::AgentSummary {
+            name: "helper".to_string(),
+            description: Some("helper agent".to_string()),
+            model: Some("claude-sonnet-4".to_string()),
+            reasoning_effort: None,
+            mode: Some("compact".to_string()),
+            source: commands::DefinitionSource::Plugin,
+            shadowed_by: None,
+            plugin: Some("demo".to_string()),
+        };
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir should exist");
+        with_current_dir(&root, || {
+            let mentioned = detect_mentioned_agent("@Helper summarize the repo", &[agent])
+                .expect("mention should resolve case-insensitively");
+            assert_eq!(mentioned.name, "helper");
+            assert_eq!(mentioned.model.as_deref(), Some("claude-sonnet-4"));
+        });
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn find_agent_file_matches_file_stem_case_insensitively() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let agents_dir = root.join(".claw").join("agents");
+        fs::create_dir_all(&agents_dir).expect("agents dir should exist");
+        fs::write(agents_dir.join("Helper.md"), "# helper\n").expect("write agent file");
+        with_current_dir(&root, || {
+            let found = find_agent_file(&root, "helper")
+                .expect("case-insensitive file-stem lookup should resolve");
+            assert!(
+                found.is_file(),
+                "resolved agent file should exist on disk, got: {}",
+                found.display()
+            );
         });
         fs::remove_dir_all(root).ok();
     }
