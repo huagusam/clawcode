@@ -3088,8 +3088,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                     if let Some(value) = json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&value)
-                                .expect("resume command json output")
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
                         );
                     } else if let Some(message) = message {
                         println!("{message}");
@@ -4096,7 +4095,7 @@ impl BuiltRuntime {
         let runtime = self
             .runtime
             .take()
-            .expect("runtime should exist before installing hook abort signal");
+            .unwrap_or_else(|| internal_error("runtime should exist before installing hook abort signal"));
         self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
         self
     }
@@ -4129,7 +4128,7 @@ impl Deref for BuiltRuntime {
     fn deref(&self) -> &Self::Target {
         self.runtime
             .as_ref()
-            .expect("runtime should exist while built runtime is alive")
+            .unwrap_or_else(|| internal_error("runtime should exist while built runtime is alive"))
     }
 }
 
@@ -4137,7 +4136,7 @@ impl DerefMut for BuiltRuntime {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.runtime
             .as_mut()
-            .expect("runtime should exist while built runtime is alive")
+            .unwrap_or_else(|| internal_error("runtime should exist while built runtime is alive"))
     }
 }
 
@@ -7641,7 +7640,7 @@ impl InternalPromptProgressReporter {
                 .shared
                 .state
                 .lock()
-                .expect("internal prompt progress state poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.step += 1;
             state.phase = if state.step == 1 {
                 "analyzing request".to_string()
@@ -7666,7 +7665,7 @@ impl InternalPromptProgressReporter {
                 .shared
                 .state
                 .lock()
-                .expect("internal prompt progress state poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.step += 1;
             state.phase = format!("running {name}");
             state.detail = Some(detail);
@@ -7691,7 +7690,7 @@ impl InternalPromptProgressReporter {
                 .shared
                 .state
                 .lock()
-                .expect("internal prompt progress state poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.saw_final_text {
                 return;
             }
@@ -7723,7 +7722,7 @@ impl InternalPromptProgressReporter {
         self.shared
             .state
             .lock()
-            .expect("internal prompt progress state poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -7736,7 +7735,7 @@ impl InternalPromptProgressReporter {
             .shared
             .output_lock
             .lock()
-            .expect("internal prompt progress output lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stdout = io::stdout();
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
@@ -8270,24 +8269,29 @@ impl ApiClient for AnthropicRuntimeClient {
             let msg_len = request.messages.len();
             let model_name = Some(self.model.as_str());
 
-            // Phase 2: incremental conversion cache.
-            if let Some(cache) = &self.message_cache {
-                if cache.last_ptr == msg_ptr && cache.last_len <= msg_len {
-                    let cache = self.message_cache.as_mut().unwrap();
-                    if msg_len > cache.last_len {
-                        let (delta_inputs, delta_cached) =
-                            convert_messages_inner(&request.messages[cache.last_len..], None, None, model_name);
-                        Arc::make_mut(&mut cache.input_messages).extend(delta_inputs);
-                        Arc::make_mut(&mut cache.cached_values).extend(delta_cached);
-                        cache.last_len = msg_len;
-                    }
-                    (
-                        Arc::clone(&cache.input_messages),
-                        Arc::clone(&cache.cached_values),
-                    )
-                } else {
-                    full_convert_and_cache_cli(&mut self.message_cache, &request, msg_ptr, msg_len, model_name)
+            // Phase 2: incremental conversion cache. Decide which path to take
+            // with a shared borrow first, then take the mutable borrow exactly
+            // once in the chosen branch — avoids the former `as_mut().unwrap()`.
+            let use_incremental = self
+                .message_cache
+                .as_ref()
+                .is_some_and(|cache| cache.last_ptr == msg_ptr && cache.last_len <= msg_len);
+            if use_incremental {
+                let cache = self
+                    .message_cache
+                    .as_mut()
+                    .unwrap_or_else(|| internal_error("message cache disappeared between checks"));
+                if msg_len > cache.last_len {
+                    let (delta_inputs, delta_cached) =
+                        convert_messages_inner(&request.messages[cache.last_len..], None, None, model_name);
+                    Arc::make_mut(&mut cache.input_messages).extend(delta_inputs);
+                    Arc::make_mut(&mut cache.cached_values).extend(delta_cached);
+                    cache.last_len = msg_len;
                 }
+                (
+                    Arc::clone(&cache.input_messages),
+                    Arc::clone(&cache.cached_values),
+                )
             } else {
                 full_convert_and_cache_cli(&mut self.message_cache, &request, msg_ptr, msg_len, model_name)
             }
@@ -8644,7 +8648,10 @@ fn full_convert_and_cache_cli(
     msg_len: usize,
     model_name: Option<&str>,
 ) -> (Arc<Vec<InputMessage>>, Arc<Vec<Option<Value>>>) {
-    let image_cache = request.image_cache.as_ref().map(|arc| arc.lock().unwrap());
+    let image_cache = request
+        .image_cache
+        .as_ref()
+        .map(|arc| arc.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     let image_store = request.image_store.as_ref();
     let (msgs_arc, vals) =
         convert_messages_cached(&request.messages, image_cache.as_deref(), image_store, model_name);
@@ -9480,13 +9487,13 @@ fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
         .get("backgroundTaskId")
         .and_then(|value| value.as_str())
     {
-        write!(&mut lines[0], " backgrounded ({task_id})").expect("write to string");
+        let _ = write!(&mut lines[0], " backgrounded ({task_id})");
     } else if let Some(status) = parsed
         .get("returnCodeInterpretation")
         .and_then(|value| value.as_str())
         .filter(|status| !status.is_empty())
     {
-        write!(&mut lines[0], " {status}").expect("write to string");
+        let _ = write!(&mut lines[0], " {status}");
     }
 
     let stdout = parsed
@@ -10487,7 +10494,7 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         apply_red_if, classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
-        render_error_red,
+        render_error_red, EXIT_INTERNAL_ERROR,
         describe_tool_progress, filter_tool_specs, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
@@ -14500,6 +14507,11 @@ UU conflicted.rs",
         // the Box<dyn Error> the REPL chain uses.
         let ok: Result<_, Box<dyn std::error::Error>> = status_context(Some(std::path::Path::new("/definitely/missing")));
         assert!(ok.is_ok(), "status_context should succeed under normal conditions");
+    }
+
+    #[test]
+    fn built_runtime_invariant_uses_internal_error_exit_code() {
+        assert_eq!(EXIT_INTERNAL_ERROR, 70);
     }
 }
 
