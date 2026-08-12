@@ -923,3 +923,83 @@ fn sample_request(stream: bool) -> MessageRequest {
         ..Default::default()
     }
 }
+
+#[tokio::test]
+async fn stream_message_returns_stream_timeout_when_provider_stalls() {
+    let _guard = env_lock();
+    let temp_root = std::env::temp_dir().join(format!(
+        "api-stream-stall-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let stall = tokio::spawn(async move {
+        // Serve requests until the listener closes. The count_tokens preflight
+        // (when it runs) must get a 400 JSON so the best-effort heuristic
+        // falls back; the stream request gets SSE headers and then stalls.
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(_) => break,
+            };
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let request_line = String::from_utf8_lossy(&buf[..]);
+            if request_line.contains("/count_tokens") {
+                let body = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"mock\"}}";
+                let head = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.expect("write preflight");
+                socket.write_all(body.as_bytes()).await.expect("write preflight body");
+                socket.flush().await.expect("flush preflight");
+            } else {
+                // The stream request: send SSE headers, then hold the
+                // connection open WITHOUT sending any bytes → idle stall.
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+                socket.write_all(head.as_bytes()).await.expect("write stream head");
+                socket.flush().await.expect("flush stream head");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let _ = socket.shutdown().await;
+                break;
+            }
+        }
+    });
+
+    let client = ApiClient::new("test-key")
+        .with_base_url(format!("http://{addr}"))
+        .with_stream_idle_timeout(Duration::from_millis(50));
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_stream_timeout = false;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next_event()).await {
+            Ok(Ok(Some(_event))) => continue,
+            Ok(Ok(None)) => break,
+            Ok(Err(ApiError::StreamTimeout)) => {
+                saw_stream_timeout = true;
+                break;
+            }
+            Ok(Err(other)) => panic!("unexpected error: {other}"),
+            Err(_elapsed) => panic!("test deadline exceeded"),
+        }
+    }
+    assert!(
+        saw_stream_timeout,
+        "a provider that opens the connection but sends no bytes must surface StreamTimeout"
+    );
+
+    stall.abort();
+    std::fs::remove_dir_all(temp_root).ok();
+}

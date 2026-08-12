@@ -39,6 +39,12 @@ pub enum ApiError {
     Auth(String),
     InvalidApiKeyEnv(VarError),
     Http(reqwest::Error),
+    /// The provider accepted the connection and streamed response headers but
+    /// then sent no bytes for longer than the configured idle timeout. This is
+    /// the "connection open, no data" stall that previously hung the subagent
+    /// OS thread indefinitely. Retryable so the provider fallback chain or the
+    /// parent turn can recover instead of blocking forever.
+    StreamTimeout,
     Io(std::io::Error),
     Json {
         provider: String,
@@ -126,6 +132,7 @@ impl ApiError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+            Self::StreamTimeout => true,
             Self::Api {
                 retryable,
                 error_type,
@@ -165,6 +172,7 @@ impl ApiError {
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
+            | Self::StreamTimeout
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
@@ -190,7 +198,7 @@ impl ApiError {
             Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
             Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
             Self::Api { .. } => "provider_error",
-            Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
+            Self::Http(_) | Self::StreamTimeout | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
@@ -214,6 +222,7 @@ impl ApiError {
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
+            | Self::StreamTimeout
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
@@ -244,6 +253,7 @@ impl ApiError {
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
             | Self::Http(_)
+            | Self::StreamTimeout
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
@@ -306,6 +316,12 @@ impl Display for ApiError {
                 write!(f, "failed to read credential environment variable: {error}")
             }
             Self::Http(error) => write!(f, "http error: {error}"),
+            Self::StreamTimeout => {
+                write!(
+                    f,
+                    "provider stream idle timeout: no bytes received within the configured window"
+                )
+            }
             Self::Io(error) => write!(f, "io error: {error}"),
             Self::Json {
                 provider,
@@ -549,6 +565,18 @@ mod tests {
         assert_eq!(error.safe_failure_class(), "provider_internal");
         assert_eq!(error.request_id(), Some("req_jobdori_123"));
         assert!(error.to_string().contains("[trace req_jobdori_123]"));
+    }
+
+    #[test]
+    fn stream_timeout_is_retryable_transport_error() {
+        let error = ApiError::StreamTimeout;
+        assert!(error.is_retryable(), "a stalled stream must be retryable");
+        assert_eq!(error.safe_failure_class(), "provider_transport");
+        assert_eq!(error.request_id(), None);
+        assert!(
+            error.to_string().contains("stream idle timeout"),
+            "display should name the failure: {error}"
+        );
     }
 
     #[test]

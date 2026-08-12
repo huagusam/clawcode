@@ -1,8 +1,21 @@
 use crate::error::ApiError;
+use std::time::Duration;
 
 const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+
+/// Maximum time allowed for establishing the TCP connection. Bounds connect
+/// stalls for every request (streaming and non-streaming alike).
+pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall deadline for non-streaming requests (send_message, count_tokens).
+/// NOT applied to streaming requests: a long generation stream legitimately
+/// exceeds this window, so streaming is bounded per-chunk instead.
+pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Idle timeout between SSE chunks. A provider that accepts the connection and
+/// sends headers but then stalls (half-open TCP, proxy hang, throttling
+/// without bytes) errors here instead of blocking the caller forever.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Snapshot of the proxy-related environment variables that influence the
 /// outbound HTTP client. Captured up front so callers can inspect, log, and
@@ -71,7 +84,12 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 /// first outbound request instead of at construction time.
 #[must_use]
 pub fn build_http_client_or_default() -> reqwest::Client {
-    build_http_client().unwrap_or_else(|_| reqwest::Client::new())
+    build_http_client().unwrap_or_else(|_| {
+        reqwest::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests
@@ -81,7 +99,9 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT);
 
     let no_proxy = config
         .no_proxy

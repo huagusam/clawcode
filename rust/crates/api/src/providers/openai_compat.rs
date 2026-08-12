@@ -69,6 +69,8 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    stream_idle_timeout: Duration,
+    request_timeout: Duration,
 }
 
 impl OpenAiCompatClient {
@@ -90,6 +92,8 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            stream_idle_timeout: crate::http_client::STREAM_IDLE_TIMEOUT,
+            request_timeout: crate::http_client::HTTP_REQUEST_TIMEOUT,
         }
     }
 
@@ -119,6 +123,18 @@ impl OpenAiCompatClient {
         self.max_retries = max_retries;
         self.initial_backoff = initial_backoff;
         self.max_backoff = max_backoff;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -192,6 +208,7 @@ impl OpenAiCompatClient {
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
+            stream_idle_timeout: self.stream_idle_timeout,
         })
     }
 
@@ -257,14 +274,18 @@ impl OpenAiCompatClient {
         // Send the request - use .json() for proper serialization
         let request_url = chat_completions_endpoint(&self.base_url);
 
-        self.http
+        let request_builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&payload);
+        let request_builder = if request.stream {
+            request_builder
+        } else {
+            request_builder.timeout(self.request_timeout)
+        };
+        request_builder.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -353,6 +374,7 @@ pub struct MessageStream {
     pending: VecDeque<StreamEvent>,
     done: bool,
     state: StreamState,
+    stream_idle_timeout: Duration,
 }
 
 impl MessageStream {
@@ -375,15 +397,21 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
-                    for parsed in self.parser.push(&chunk)? {
-                        self.pending.extend(self.state.ingest_chunk(parsed)?);
+            match tokio::time::timeout(self.stream_idle_timeout, self.response.chunk()).await {
+                Ok(Ok(chunk)) => {
+                    match chunk {
+                        Some(chunk) => {
+                            for parsed in self.parser.push(&chunk)? {
+                                self.pending.extend(self.state.ingest_chunk(parsed)?);
+                            }
+                        }
+                        None => {
+                            self.done = true;
+                        }
                     }
                 }
-                None => {
-                    self.done = true;
-                }
+                Ok(Err(error)) => return Err(ApiError::from(error)),
+                Err(_elapsed) => return Err(ApiError::StreamTimeout),
             }
         }
     }

@@ -102,6 +102,8 @@ pub struct AnthropicClient {
     prompt_cache: Option<PromptCache>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
     incremental_body: Arc<std::sync::Mutex<Option<IncrementalBody>>>,
+    stream_idle_timeout: Duration,
+    request_timeout: Duration,
 }
 
 impl AnthropicClient {
@@ -119,6 +121,8 @@ impl AnthropicClient {
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
             incremental_body: Arc::new(std::sync::Mutex::new(None)),
+            stream_idle_timeout: crate::http_client::STREAM_IDLE_TIMEOUT,
+            request_timeout: crate::http_client::HTTP_REQUEST_TIMEOUT,
         }
     }
 
@@ -136,6 +140,8 @@ impl AnthropicClient {
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
             incremental_body: Arc::new(std::sync::Mutex::new(None)),
+            stream_idle_timeout: crate::http_client::STREAM_IDLE_TIMEOUT,
+            request_timeout: crate::http_client::HTTP_REQUEST_TIMEOUT,
         }
     }
 
@@ -204,6 +210,18 @@ impl AnthropicClient {
     #[must_use]
     pub fn with_incremental_body(mut self) -> Self {
         self.incremental_body = Arc::new(std::sync::Mutex::new(Some(IncrementalBody::new())));
+        self
+    }
+
+    #[must_use]
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -346,6 +364,7 @@ impl AnthropicClient {
             latest_usage: None,
             usage_recorded: false,
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
+            stream_idle_timeout: self.stream_idle_timeout,
         })
     }
 
@@ -509,6 +528,12 @@ impl AnthropicClient {
             }
         };
 
+        let request_builder = if request.stream {
+            request_builder
+        } else {
+            request_builder.timeout(self.request_timeout)
+        };
+
         request_builder.send().await.map_err(ApiError::from)
     }
 
@@ -581,6 +606,7 @@ impl AnthropicClient {
         let response = self
             .build_request(&request_url)
             .json(&request_body)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(ApiError::from)?;
@@ -827,6 +853,7 @@ pub struct MessageStream {
     latest_usage: Option<Usage>,
     usage_recorded: bool,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    stream_idle_timeout: Duration,
 }
 
 impl MessageStream {
@@ -851,13 +878,19 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
-                    self.pending.extend(self.parser.push(&chunk)?);
+            match tokio::time::timeout(self.stream_idle_timeout, self.response.chunk()).await {
+                Ok(Ok(chunk)) => {
+                    match chunk {
+                        Some(chunk) => {
+                            self.pending.extend(self.parser.push(&chunk)?);
+                        }
+                        None => {
+                            self.done = true;
+                        }
+                    }
                 }
-                None => {
-                    self.done = true;
-                }
+                Ok(Err(error)) => return Err(ApiError::from(error)),
+                Err(_elapsed) => return Err(ApiError::StreamTimeout),
             }
         }
     }
