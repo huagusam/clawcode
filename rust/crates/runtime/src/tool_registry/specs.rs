@@ -50,6 +50,32 @@ mod tests {
             "read_file schema must keep `additionalProperties: false` to reject unknown fields"
         );
     }
+
+    #[test]
+    fn agent_schema_advertises_mode_and_reasoning_effort() {
+        let specs = mvp_tool_specs();
+        let spec = find_spec(&specs, "Agent");
+        let properties = spec
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("Agent schema should have properties");
+        // The forced @agent tool_input sends `mode` and `reasoning_effort` (and
+        // AgentInput deserializes them). If the schema hides them, the LLM
+        // invents a malformed shape for the Agent tool (e.g. a `raw` wrapper).
+        for field in ["mode", "reasoning_effort"] {
+            assert!(
+                properties.contains_key(field),
+                "Agent schema must declare `{field}` so the LLM knows the parameter exists; \
+                 current properties: {properties:?}"
+            );
+        }
+        assert_eq!(
+            spec.input_schema.get("additionalProperties"),
+            Some(&Value::Bool(false)),
+            "Agent schema must keep `additionalProperties: false` to reject unknown fields"
+        );
+    }
 }
 
 #[must_use]
@@ -315,6 +341,8 @@ For MCP, plugin, or skill work that is multi-step or benefits from isolated cont
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
                     "model": { "type": "string" },
+                    "mode": { "type": "string", "description": "Agent mode from the definition. Display-only; not consumed by the runtime." },
+                    "reasoning_effort": { "type": "string", "description": "Reasoning-effort level (e.g. low/medium/high) forwarded to the provider." },
                     "system_prompt": { "type": "array", "items": { "type": "string" }, "description": "Optional explicit system prompt lines." },
                     "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Optional tool allowlist override for the sub-agent." }
                 },
