@@ -2936,6 +2936,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_without_custom_prompt_propagates_system_prompt_build_error() {
+        let _guard = env_guard();
+        let root = temp_path("bad-config-agent");
+        let claw_dir = root.join(".claw");
+        fs::create_dir_all(&claw_dir).expect("claw dir should exist");
+        // Top-level non-object JSON makes ConfigLoader::load fail, so
+        // build_agent_system_prompt errors. Without a custom system_prompt the
+        // error must propagate instead of silently running with an empty prompt.
+        fs::write(claw_dir.join("settings.json"), "[]").expect("write bad settings");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_agent_with_spawn(
+                AgentInput {
+                    description: "Effort test".to_string(),
+                    prompt: "Deep dive.".to_string(),
+                    subagent_type: Some("Explore".to_string()),
+                    name: Some("effort-agent".to_string()),
+                    model: None,
+                    system_prompt: None,
+                    allowed_tools: None,
+                    mode: None,
+                    reasoning_effort: None,
+                },
+                |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
+            )
+        }));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).ok();
+
+        let result = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        assert!(
+            result.is_err(),
+            "system-prompt build failure with no custom prompt must propagate"
+        );
+    }
+
+    #[test]
     fn general_purpose_agent_inherits_registered_runtime_tools() {
         // Register a runtime tool provider (idempotent across this binary) so
         // the general-purpose sub-agent's allowed_tools union picks up the
@@ -5423,24 +5464,27 @@ where
 
     let handle_manifest = manifest.clone();
 
+    // Build the system prompt before constructing the job so a prompt-build
+    // failure propagates instead of silently spawning the agent with an empty
+    // prompt. A caller-supplied custom prompt is a complete system prompt on
+    // its own, so it still takes precedence even when the derived base fails
+    // to build (e.g. a broken project config).
+    let system_prompt = match input.system_prompt {
+        Some(custom) => match build_agent_system_prompt(lookup_subagent) {
+            Ok(mut base) if !base.is_empty() => {
+                base.extend(custom);
+                base
+            }
+            _ => custom,
+        },
+        None => build_agent_system_prompt(lookup_subagent)?,
+    };
+
     let job = agents::AgentJob {
         manifest,
         prompt: input.prompt,
         reasoning_effort: input.reasoning_effort,
-        system_prompt: {
-            let mut base = build_agent_system_prompt(lookup_subagent).unwrap_or_default();
-            match input.system_prompt {
-                Some(custom) => {
-                    if base.is_empty() {
-                        custom
-                    } else {
-                        base.extend(custom);
-                        base
-                    }
-                }
-                None => base,
-            }
-        },
+        system_prompt,
         allowed_tools: {
             let mut allowed = input
                 .allowed_tools
