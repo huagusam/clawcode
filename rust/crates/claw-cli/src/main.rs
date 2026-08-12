@@ -1351,6 +1351,11 @@ fn detect_mentioned_agent(
     let resolved_name = matched.map_or_else(|| name.clone(), |a| a.name().to_string());
     let (content, model, mode, reasoning_effort, allowed_tools, subagent_type) =
         if let Some(agent) = matched {
+            // Look up by the canonical frontmatter name first. find_agent_file
+            // matches both the file stem and any frontmatter `name:`, so an
+            // agent whose display name differs from its filename is still
+            // resolved to its file instead of silently degrading to the
+            // description.
             let file = find_agent_file(&cwd, &resolved_name)
                 .and_then(|p| read_agent_file_lossy(&p).ok());
             match file {
@@ -1534,7 +1539,9 @@ fn resolve_mentions(input: &str, agents: &[commands::AgentSummary]) -> String {
 /// Only supports `name.md` single-file format (no directory/SKILL.md).
 /// Matching is case-insensitive on the file stem so `@Helper` resolves a
 /// `helper.md` definition on case-sensitive filesystems (NTFS/APFS already
-/// match by themselves, but Linux/macOS do not).
+/// match by themselves, but Linux/macOS do not). When the file stem does not
+/// match, the file's frontmatter `name:` is consulted, so an agent whose
+/// display name differs from its filename is still resolved.
 fn find_agent_file(cwd: &Path, name: &str) -> Option<PathBuf> {
     let roots = commands::discover_agent_roots(cwd);
     for dir in &roots {
@@ -1545,11 +1552,21 @@ fn find_agent_file(cwd: &Path, name: &str) -> Option<PathBuf> {
                 return Some(candidate);
             }
         }
-        // Slow path: scan the directory for a case-insensitive file-stem match.
+        // Slow path: scan the directory for a case-insensitive file-stem match
+        // or a matching frontmatter `name:`.
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !path.is_file() {
+                    continue;
+                }
+                let ext_ok = path.extension().is_some_and(|ext| {
+                    matches!(
+                        ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                        "md" | "txt" | "toml"
+                    )
+                });
+                if !ext_ok {
                     continue;
                 }
                 let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string())
@@ -1560,14 +1577,17 @@ fn find_agent_file(cwd: &Path, name: &str) -> Option<PathBuf> {
                     // The directory may hold e.g. `foo.md` and `foo.txt`; the
                     // fast path already preferred the exact-case file, so any
                     // case-insensitive hit here is the definition we want.
-                    let ext_ok = path.extension().is_some_and(|ext| {
-                        matches!(
-                            ext.to_string_lossy().to_ascii_lowercase().as_str(),
-                            "md" | "txt" | "toml"
-                        )
-                    });
-                    if ext_ok {
-                        return Some(path);
+                    return Some(path);
+                }
+                // Frontmatter `name:` may differ from the filename (beyond
+                // case). Resolve those too so @DisplayName still finds the file.
+                if let Ok(contents) = read_agent_file_lossy(&path) {
+                    if let Ok(parsed) = plugins::frontmatter::parse_frontmatter(&contents) {
+                        if let Some(fm_name) = &parsed.frontmatter.name {
+                            if fm_name.eq_ignore_ascii_case(name) {
+                                return Some(path);
+                            }
+                        }
                     }
                 }
             }
@@ -12542,6 +12562,48 @@ mod tests {
             assert_eq!(
                 mentioned.allowed_tools.as_deref(),
                 Some(&["read_file".to_string(), "grep_search".to_string()][..])
+            );
+        });
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn detect_mentioned_agent_falls_back_to_mention_name_when_frontmatter_name_differs_from_filename() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let agents_dir = root.join(".claw").join("agents");
+        fs::create_dir_all(&agents_dir).expect("agents dir should exist");
+        // Frontmatter declares a display name that differs from the filename
+        // beyond case (frontmatter `name: my-helper`, file `helper.md`). The
+        // mention @my-helper matches the plugin summary; the file lookup must
+        // still find `helper.md` by the raw mention name instead of silently
+        // degrading to the description.
+        fs::write(
+            agents_dir.join("helper.md"),
+            "---\nname: my-helper\ndescription: helper agent\nmodel: claude-sonnet-4\n---\n\nYou are the helper agent.\n",
+        )
+        .expect("agent file should write");
+        let plugin = commands::AgentSummary {
+            name: "my-helper".to_string(),
+            description: Some("helper agent".to_string()),
+            model: Some("claude-sonnet-4".to_string()),
+            reasoning_effort: None,
+            mode: None,
+            subagent_type: None,
+            tools: None,
+            skills: None,
+            source: commands::DefinitionSource::Plugin,
+            shadowed_by: None,
+            plugin: Some("demo".to_string()),
+        };
+        with_current_dir(&root, || {
+            let mentioned: MentionedAgent = detect_mentioned_agent("@my-helper summarize the repo", &[plugin])
+                .expect("mention should resolve");
+            assert_eq!(mentioned.name, "my-helper");
+            assert!(
+                mentioned.content.contains("You are the helper agent."),
+                "content should come from the file, not the description; got: {}",
+                mentioned.content
             );
         });
         fs::remove_dir_all(root).ok();
