@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use runtime::strip_verbatim_prefix;
@@ -87,36 +87,6 @@ impl AgentDiscovery {
         let roots = discover_definition_roots(cwd, "agents");
         if let Ok(mut found) = load_agents_from_roots(&roots) {
             agents.append(&mut found);
-        }
-        agents.sort_by(|a, b| a.name.cmp(&b.name));
-        let active_names = agents
-            .iter()
-            .filter(|a| a.shadowed_by.is_none())
-            .map(|a| a.name.clone())
-            .collect();
-        Self { agents, active_names }
-    }
-
-    pub fn with_plugins(
-        cwd: &Path,
-        plugin_agent_paths: &BTreeMap<String, Vec<PathBuf>>,
-    ) -> Self {
-        let mut agents = Vec::new();
-        let roots = discover_definition_roots(cwd, "agents");
-        if let Ok(mut found) = load_agents_from_roots(&roots) {
-            agents.append(&mut found);
-        }
-        let root_names: BTreeSet<String> = agents
-            .iter()
-            .filter(|a| a.shadowed_by.is_none())
-            .map(|a| a.name.to_ascii_lowercase())
-            .collect();
-        let plugin_agents = load_plugin_agents(plugin_agent_paths);
-        for mut agent in plugin_agents {
-            if root_names.contains(&agent.name.to_ascii_lowercase()) {
-                agent.shadowed_by = Some(DefinitionSource::ProjectClaw);
-            }
-            agents.push(agent);
         }
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         let active_names = agents
@@ -336,47 +306,6 @@ fn load_agents_from_roots(
     }
 
     Ok(agents)
-}
-
-fn load_plugin_agents(
-    plugin_agent_paths: &BTreeMap<String, Vec<PathBuf>>,
-) -> Vec<AgentSummary> {
-    let mut agents = Vec::new();
-    for (plugin_id, paths) in plugin_agent_paths {
-        for path in paths {
-            if !path.is_file() {
-                continue;
-            }
-            let contents = match read_file_lossy(path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[plugin agents] error reading {}: {e}", path.display());
-                    continue;
-                }
-            };
-            let fm = plugins::frontmatter::parse_frontmatter(&contents)
-                .ok()
-                .map(|p| p.frontmatter);
-            let fallback_name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            agents.push(AgentSummary {
-                name: fm
-                    .as_ref()
-                    .and_then(|f| f.name.clone())
-                    .unwrap_or(fallback_name),
-                description: fm.as_ref().and_then(|f| f.description.clone()),
-                model: fm.as_ref().and_then(|f| f.model.clone()),
-                reasoning_effort: fm.as_ref().and_then(|f| f.reasoning_effort.clone()),
-                mode: fm.as_ref().and_then(|f| f.mode.clone()),
-                source: DefinitionSource::Plugin,
-                shadowed_by: None,
-                plugin: Some(plugin_id.clone()),
-            });
-        }
-    }
-    agents
 }
 
 fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
