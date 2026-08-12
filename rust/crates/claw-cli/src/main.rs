@@ -257,15 +257,13 @@ fn main() {
             let kind = classify_error_kind(&message);
             if message.contains("`claw --help`") {
                 eprintln!(
-                    "[error-kind: {kind}]
-error: {message}"
+                    "[error-kind: {kind}]\n{}",
+                    render_error_red(&format!("error: {message}"))
                 );
             } else {
                 eprintln!(
-                    "[error-kind: {kind}]
-error: {message}
-
-Run `claw --help` for usage."
+                    "[error-kind: {kind}]\n{}\n\nRun `claw --help` for usage.",
+                    render_error_red(&format!("error: {message}"))
                 );
             }
         }
@@ -2987,7 +2985,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                     })
                 );
             } else {
-                eprintln!("failed to restore session: {error}");
+                eprint_red_error(&format!("failed to restore session: {error}"));
             }
             std::process::exit(1);
         }
@@ -3040,7 +3038,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         })
                     );
                 } else {
-                    eprintln!("/{cmd_root} is not yet implemented in this build");
+                    eprint_red_error(&format!("/{cmd_root} is not yet implemented in this build"));
                 }
                 std::process::exit(2);
             }
@@ -3059,7 +3057,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         })
                     );
                 } else {
-                    eprintln!("unsupported resumed command: {raw_command}");
+                    eprint_red_error(&format!("unsupported resumed command: {raw_command}"));
                 }
                 std::process::exit(2);
             }
@@ -3074,7 +3072,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         })
                     );
                 } else {
-                    eprintln!("{error}");
+                    eprint_red_error(&error.to_string());
                 }
                 std::process::exit(2);
             }
@@ -3111,7 +3109,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                         })
                     );
                 } else {
-                    eprintln!("{error}");
+                    eprint_red_error(&error.to_string());
                 }
                 std::process::exit(2);
             }
@@ -3853,7 +3851,7 @@ fn enforce_broad_cwd_policy(
         io::stdin().read_line(&mut input)?;
         let trimmed = input.trim().to_lowercase();
         if trimmed != "y" && trimmed != "yes" {
-            eprintln!("Aborted.");
+            eprint_red_error("Aborted.");
             std::process::exit(0);
         }
         Ok(())
@@ -3877,7 +3875,7 @@ fn enforce_broad_cwd_policy(
                 );
             }
             CliOutputFormat::Text => {
-                eprintln!("error: {message}");
+                eprint_red_error(&format!("error: {message}"));
             }
         }
         std::process::exit(1);
@@ -10487,6 +10485,7 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         apply_red_if, classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
+        render_error_red,
         describe_tool_progress, filter_tool_specs, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_connected_line,
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
@@ -10522,7 +10521,7 @@ mod tests {
     };
     use serde_json::json;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{self, IsTerminal, Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -14473,6 +14472,21 @@ UU conflicted.rs",
         let text = "boom";
         assert_eq!(apply_red_if(text, true), "\x1b[31mboom\x1b[0m");
         assert_eq!(apply_red_if(text, false), "boom");
+    }
+
+    #[test]
+    fn main_error_text_branch_keeps_error_kind_line_plain() {
+        // The machine-scanning `[error-kind: ...]` line must never carry ANSI;
+        // only the human-facing `error:` line is colored.
+        let message = "boom";
+        let kind_line = format!("[error-kind: {}]", classify_error_kind(message));
+        let error_line = render_error_red(&format!("error: {message}"));
+        assert!(!kind_line.contains('\x1b'), "error-kind line must stay plain");
+        assert!(
+            error_line.contains('\x1b') || !io::stderr().is_terminal(),
+            "error line carries ANSI on a TTY"
+        );
+        assert!(error_line.contains("error: boom"));
     }
 }
 
