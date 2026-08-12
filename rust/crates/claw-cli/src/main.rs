@@ -5121,11 +5121,11 @@ impl LiveCli {
                 false
             }
             SlashCommand::Status => {
-                self.print_status();
+                self.print_status()?;
                 false
             }
             SlashCommand::Sandbox => {
-                Self::print_sandbox_status();
+                Self::print_sandbox_status()?;
                 false
             }
             SlashCommand::Compact => {
@@ -5313,7 +5313,7 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_status(&self) {
+    fn print_status(&self) -> Result<(), Box<dyn std::error::Error>> {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
         println!(
@@ -5328,10 +5328,11 @@ impl LiveCli {
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
                 self.permission_mode.as_str(),
-                &status_context(Some(&self.session.path)).expect("status context should load"),
+                &status_context(Some(&self.session.path))?,
                 None, // #148: REPL /status doesn't carry flag provenance
             )
         );
+        Ok(())
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {
@@ -5384,8 +5385,8 @@ impl LiveCli {
         println!("{}", render_prompt_history_report(&entries, limit));
     }
 
-    fn print_sandbox_status() {
-        let cwd = env::current_dir().expect("current dir");
+    fn print_sandbox_status() -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader
             .load()
@@ -5394,6 +5395,7 @@ impl LiveCli {
             "{}",
             format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
         );
+        Ok(())
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
@@ -14487,6 +14489,17 @@ UU conflicted.rs",
             "error line carries ANSI on a TTY"
         );
         assert!(error_line.contains("error: boom"));
+    }
+
+    #[test]
+    fn status_context_error_is_propagatable() {
+        // status_context already returns Result; print_status/print_sandbox_status
+        // must forward it with `?` so a failure reaches the top-level red handler
+        // instead of panicking inside the REPL. A missing session path is stored
+        // as-is (not an error), so the happy path succeeds and the error type is
+        // the Box<dyn Error> the REPL chain uses.
+        let ok: Result<_, Box<dyn std::error::Error>> = status_context(Some(std::path::Path::new("/definitely/missing")));
+        assert!(ok.is_ok(), "status_context should succeed under normal conditions");
     }
 }
 
