@@ -130,6 +130,47 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
 }
 
 #[test]
+fn piped_stderr_error_output_carries_no_ansi_escapes() {
+    // F-1: the red-error rendering contract. When stderr is piped (non-TTY),
+    // NOTHING on stderr may carry ANSI escapes -- text branch and JSON branch
+    // alike. A regression that removed the is_terminal() gate in
+    // render_error_red would otherwise go undetected.
+    let temp_dir = unique_temp_dir("no-ansi-piped");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+    let text_output = command_in(&temp_dir)
+        .arg("/zstats")
+        .output()
+        .expect("claw should launch");
+    assert!(!text_output.status.success(), "expected /zstats to error");
+    let stderr = String::from_utf8(text_output.stderr).expect("stderr should be utf8");
+    assert!(
+        stderr.contains("unknown slash command outside the REPL: /zstats"),
+        "stderr should carry the error message, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "piped stderr must never carry ANSI escapes, got:\n{stderr}"
+    );
+
+    let json_output = command_in(&temp_dir)
+        .args(["--output-format", "json", "/zstats"])
+        .output()
+        .expect("claw should launch with --output-format json");
+    assert!(!json_output.status.success(), "expected json /zstats to error");
+    let json_stderr = String::from_utf8(json_output.stderr).expect("stderr should be utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json_stderr).expect("json stderr should parse as json");
+    assert_eq!(parsed["type"], "error");
+    assert!(
+        !json_stderr.contains('\x1b'),
+        "piped json stderr must never carry ANSI escapes, got:\n{json_stderr}"
+    );
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
 fn config_command_loads_defaults_from_standard_config_locations() {
     // given
     let temp_dir = unique_temp_dir("config-defaults");
