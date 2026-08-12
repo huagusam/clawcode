@@ -1311,6 +1311,8 @@ struct MentionedAgent {
     model: Option<String>,
     mode: Option<String>,
     reasoning_effort: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    subagent_type: Option<String>,
 }
 
 /// Detect an `@agent` mention anywhere in the input and gather the data needed
@@ -1347,28 +1349,32 @@ fn detect_mentioned_agent(
     // mention casing, so the spawned agent's manifest and hint carry the
     // declared identity even when the user typed `@HELPER`.
     let resolved_name = matched.map_or_else(|| name.clone(), |a| a.name().to_string());
-    let (content, model, mode, reasoning_effort) = if let Some(agent) = matched {
-        let file = find_agent_file(&cwd, &resolved_name)
-            .and_then(|p| read_agent_file_lossy(&p).ok());
-        match file {
-            Some(file_content) => {
-                let (model, mode, reasoning_effort) =
-                    agent_frontmatter_model_mode(&file_content);
-                (file_content, model, mode, reasoning_effort)
+    let (content, model, mode, reasoning_effort, allowed_tools, subagent_type) =
+        if let Some(agent) = matched {
+            let file = find_agent_file(&cwd, &resolved_name)
+                .and_then(|p| read_agent_file_lossy(&p).ok());
+            match file {
+                Some(file_content) => {
+                    let (model, mode, reasoning_effort, tools, subagent_type) =
+                        agent_frontmatter_model_mode(&file_content);
+                    (file_content, model, mode, reasoning_effort, tools, subagent_type)
+                }
+                None => (
+                    agent.description().unwrap_or_default().to_string(),
+                    agent.model.clone(),
+                    agent.mode.clone(),
+                    agent.reasoning_effort.clone(),
+                    agent.tools.clone(),
+                    agent.subagent_type.clone(),
+                ),
             }
-            None => (
-                agent.description().unwrap_or_default().to_string(),
-                agent.model.clone(),
-                agent.mode.clone(),
-                agent.reasoning_effort.clone(),
-            ),
-        }
-    } else {
-        let file = find_agent_file(&cwd, &resolved_name)
-            .and_then(|p| read_agent_file_lossy(&p).ok())?;
-        let (model, mode, reasoning_effort) = agent_frontmatter_model_mode(&file);
-        (file, model, mode, reasoning_effort)
-    };
+        } else {
+            let file = find_agent_file(&cwd, &resolved_name)
+                .and_then(|p| read_agent_file_lossy(&p).ok())?;
+            let (model, mode, reasoning_effort, tools, subagent_type) =
+                agent_frontmatter_model_mode(&file);
+            (file, model, mode, reasoning_effort, tools, subagent_type)
+        };
     let content = match content {
         content if !content.trim().is_empty() => content,
         _ => return None,
@@ -1381,22 +1387,33 @@ fn detect_mentioned_agent(
         model,
         mode,
         reasoning_effort,
+        allowed_tools,
+        subagent_type,
     })
 }
 
-/// Extract declared `model`/`mode`/`reasoning_effort` from an agent file's
-/// frontmatter, falling back to `(None, None, None)` when the file has no
-/// (parseable) frontmatter.
+/// Extract declared `model`/`mode`/`reasoning_effort`/`tools`/`subagent_type`
+/// from an agent file's frontmatter, falling back to all-`None` when the file
+/// has no (parseable) frontmatter.
+#[allow(clippy::type_complexity)]
 fn agent_frontmatter_model_mode(
     contents: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<String>>,
+    Option<String>,
+) {
     match plugins::frontmatter::parse_frontmatter(contents) {
         Ok(parsed) => (
             parsed.frontmatter.model,
             parsed.frontmatter.mode,
             parsed.frontmatter.reasoning_effort,
+            parsed.frontmatter.tools,
+            parsed.frontmatter.subagent_type,
         ),
-        Err(_) => (None, None, None),
+        Err(_) => (None, None, None, None, None),
     }
 }
 
@@ -1491,6 +1508,9 @@ fn resolve_mentions(input: &str, agents: &[commands::AgentSummary]) -> String {
                         shadowed_by: None,
                         plugin: None,
                         mode: None,
+                        subagent_type: None,
+                        tools: None,
+                        skills: None,
                     };
                     let mut expansion = format!("\n---\nAgent: {}\n{}\n---\n", mention, content);
                     expansion.push_str(&agent_invocation_hint(&mention, &dummy));
@@ -4081,11 +4101,12 @@ fn run_repl(
                         "name": mentioned.name,
                         "description": mentioned.name,
                         "prompt": mentioned.prompt,
-                        "subagent_type": "general-purpose",
+                        "subagent_type": mentioned.subagent_type.unwrap_or_else(|| "general-purpose".to_string()),
                         "system_prompt": [mentioned.content],
                         "model": mentioned.model,
                         "mode": mentioned.mode,
                         "reasoning_effort": mentioned.reasoning_effort,
+                        "allowed_tools": mentioned.allowed_tools,
                     })
                     .to_string();
                     editor.push_history(input);
@@ -12507,7 +12528,7 @@ mod tests {
         fs::create_dir_all(&agents_dir).expect("agents dir should exist");
         fs::write(
             agents_dir.join("helper.md"),
-            "---\nname: helper\ndescription: helper agent\nmodel: claude-sonnet-4\nmode: compact\nreasoning_effort: high\n---\n\nYou are the helper agent.\n",
+            "---\nname: helper\ndescription: helper agent\nmodel: claude-sonnet-4\nmode: compact\nreasoning_effort: high\nsubagent_type: explorer\ntools: [\"read_file\", \"grep_search\"]\n---\n\nYou are the helper agent.\n",
         )
         .expect("agent file should write");
         with_current_dir(&root, || {
@@ -12517,6 +12538,11 @@ mod tests {
             assert_eq!(mentioned.model.as_deref(), Some("claude-sonnet-4"));
             assert_eq!(mentioned.mode.as_deref(), Some("compact"));
             assert_eq!(mentioned.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(mentioned.subagent_type.as_deref(), Some("explorer"));
+            assert_eq!(
+                mentioned.allowed_tools.as_deref(),
+                Some(&["read_file".to_string(), "grep_search".to_string()][..])
+            );
         });
         fs::remove_dir_all(root).ok();
     }
@@ -12530,6 +12556,9 @@ mod tests {
             model: Some("claude-sonnet-4".to_string()),
             reasoning_effort: None,
             mode: Some("compact".to_string()),
+            subagent_type: None,
+            tools: None,
+            skills: None,
             source: commands::DefinitionSource::Plugin,
             shadowed_by: None,
             plugin: Some("demo".to_string()),

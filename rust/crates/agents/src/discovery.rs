@@ -64,6 +64,15 @@ pub struct AgentSummary {
     pub shadowed_by: Option<DefinitionSource>,
     pub plugin: Option<String>,
     pub mode: Option<String>,
+    /// Optional sub-agent kind (frontmatter `subagent_type:`). Steers the
+    /// spawned sub-agent's tool set instead of the general-purpose default.
+    pub subagent_type: Option<String>,
+    /// Declared tool allowlist from frontmatter `tools:`. When present it
+    /// constrains the spawned sub-agent's `allowed_tools`; when absent the
+    /// full tool set for the sub-agent kind is granted.
+    pub tools: Option<Vec<String>>,
+    /// Declared skill references from frontmatter `skills:`.
+    pub skills: Option<Vec<String>>,
 }
 
 impl AgentSummary {
@@ -237,6 +246,9 @@ fn load_agents_from_roots(
                             model: fm.as_ref().and_then(|f| f.model.clone()),
                             reasoning_effort: fm.as_ref().and_then(|f| f.reasoning_effort.clone()),
                             mode: fm.as_ref().and_then(|f| f.mode.clone()),
+                            subagent_type: fm.as_ref().and_then(|f| f.subagent_type.clone()),
+                            tools: fm.as_ref().and_then(|f| f.tools.clone()),
+                            skills: fm.as_ref().and_then(|f| f.skills.clone()),
                             source: *source,
                             shadowed_by: None,
                             plugin: None,
@@ -264,6 +276,9 @@ fn load_agents_from_roots(
                         model: fm.as_ref().and_then(|f| f.model.clone()),
                         reasoning_effort: fm.as_ref().and_then(|f| f.reasoning_effort.clone()),
                         mode: fm.as_ref().and_then(|f| f.mode.clone()),
+                        subagent_type: fm.as_ref().and_then(|f| f.subagent_type.clone()),
+                        tools: fm.as_ref().and_then(|f| f.tools.clone()),
+                        skills: fm.as_ref().and_then(|f| f.skills.clone()),
                         source: *source,
                         shadowed_by: None,
                         plugin: None,
@@ -286,6 +301,9 @@ fn load_agents_from_roots(
                     model: parse_toml_string(&contents, "model"),
                     reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
                     mode: parse_toml_string(&contents, "mode"),
+                    subagent_type: parse_toml_string(&contents, "subagent_type"),
+                    tools: parse_toml_list(&contents, "tools"),
+                    skills: parse_toml_list(&contents, "skills"),
                     source: *source,
                     shadowed_by: None,
                     plugin: None,
@@ -328,6 +346,36 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
         if !value.is_empty() {
             return Some(value.to_string());
         }
+    }
+    None
+}
+
+/// Parse a TOML array value like `tools = ["read_file", "grep_search"]`.
+/// Returns `None` when the key is absent or the value is not a bracketed
+/// string list.
+fn parse_toml_list(contents: &str, key: &str) -> Option<Vec<String>> {
+    let prefix = format!("{key} =");
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(value) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        let value = value.trim();
+        let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
+            continue;
+        };
+        let items: Vec<String> = inner
+            .split(',')
+            .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        return Some(items);
     }
     None
 }

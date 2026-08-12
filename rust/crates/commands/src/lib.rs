@@ -4631,6 +4631,9 @@ mod tests {
                 shadowed_by: None,
                 plugin: None,
                 mode: None,
+                subagent_type: None,
+                tools: None,
+                skills: None,
             },
             AgentSummary {
                 name: "planner".into(),
@@ -4641,6 +4644,9 @@ mod tests {
                 shadowed_by: Some(DefinitionSource::ProjectClaw),
                 plugin: None,
                 mode: None,
+                subagent_type: None,
+                tools: None,
+                skills: None,
             },
             AgentSummary {
                 name: "verifier".into(),
@@ -4651,6 +4657,9 @@ mod tests {
                 shadowed_by: None,
                 plugin: None,
                 mode: None,
+                subagent_type: None,
+                tools: None,
+                skills: None,
             },
         ];
 
@@ -4683,6 +4692,9 @@ mod tests {
                 shadowed_by: None,
                 plugin: None,
                 mode: None,
+                subagent_type: None,
+                tools: None,
+                skills: None,
             },
             AgentSummary {
                 name: "verifier".into(),
@@ -4693,6 +4705,9 @@ mod tests {
                 shadowed_by: None,
                 plugin: None,
                 mode: None,
+                subagent_type: None,
+                tools: None,
+                skills: None,
             },
             AgentSummary {
                 name: "planner".into(),
@@ -4703,6 +4718,9 @@ mod tests {
                 shadowed_by: Some(DefinitionSource::ProjectClaw),
                 plugin: None,
                 mode: None,
+                subagent_type: None,
+                tools: None,
+                skills: None,
             },
         ];
 

@@ -8,6 +8,10 @@ pub struct Frontmatter {
     pub tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub mode: Option<String>,
+    /// Optional sub-agent kind (e.g. `explorer` / `plan` / `general-purpose`).
+    /// When present it steers the spawned sub-agent's tool set instead of the
+    /// hardcoded general-purpose default.
+    pub subagent_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +53,7 @@ pub fn parse_frontmatter(content: &str) -> Result<ParsedMarkdown<'_>, Frontmatte
     let mut reasoning_effort = None;
     let mut when_to_use = None;
     let mut mode = None;
+    let mut subagent_type = None;
     let mut tools: Option<Vec<String>> = None;
     let mut skills: Option<Vec<String>> = None;
     let mut multiline_key: Option<&str> = None;
@@ -92,6 +97,12 @@ pub fn parse_frontmatter(content: &str) -> Result<ParsedMarkdown<'_>, Frontmatte
             let v = val.trim();
             if !v.is_empty() {
                 mode = Some(v.to_string());
+            }
+        } else if let Some(val) = line.strip_prefix("subagent_type:") {
+            multiline_key = None;
+            let v = val.trim();
+            if !v.is_empty() && !v.starts_with('|') {
+                subagent_type = Some(v.to_string());
             }
         } else if let Some(val) = line.strip_prefix("tools:") {
             multiline_key = None;
@@ -154,6 +165,7 @@ pub fn parse_frontmatter(content: &str) -> Result<ParsedMarkdown<'_>, Frontmatte
             tools,
             skills,
             mode,
+            subagent_type,
         },
         body,
     })
