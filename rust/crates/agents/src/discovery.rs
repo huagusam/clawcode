@@ -63,6 +63,8 @@ pub struct AgentSummary {
     pub source: DefinitionSource,
     pub shadowed_by: Option<DefinitionSource>,
     pub plugin: Option<String>,
+    /// Display-only agent mode (frontmatter `mode:`). Reported but not
+    /// consumed by the runtime/spawn (MessageRequest has no `mode` field).
     pub mode: Option<String>,
     /// Optional sub-agent kind (frontmatter `subagent_type:`). Steers the
     /// spawned sub-agent's tool set instead of the general-purpose default.

@@ -121,6 +121,8 @@ pub struct AgentOutput {
     #[serde(rename = "subagentType")]
     pub subagent_type: Option<String>,
     pub model: Option<String>,
+    /// Display-only agent mode echoed from the definition; not consumed by
+    /// the runtime or any provider request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,6 +165,10 @@ pub struct AgentInput {
     /// inferred from `subagent_type`.
     #[serde(default)]
     pub allowed_tools: Option<BTreeSet<String>>,
+    /// Optional agent mode (frontmatter `mode:`). Display-only: echoed into
+    /// the manifest/report but NOT consumed by the runtime, spawn, or any
+    /// provider request (MessageRequest has no `mode` field). Kept for
+    /// reporting parity with the definition.
     #[serde(default)]
     pub mode: Option<String>,
     /// Optional reasoning-effort level (e.g. `low`/`medium`/`high`) forwarded
