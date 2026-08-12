@@ -8,14 +8,14 @@ Get the two files from [GitHub Releases](https://github.com/huagusam/clawcode/re
 
 | File | Download URL | Description |
 |---|---|---|
-| `Config_methods.zip` | [Download here](https://github.com/huagusam/clawcode/releases/download/v0.2.2.1/Config_methods.zip) | **Full installer package** — includes `claw.exe`, Git, fd, rg, config files, and the installation script |
+| `Config_methods.7z` | [Download here](https://github.com/huagusam/clawcode/releases/download/v0.2.2.2/Config_methods.7z) | **Full installer package** — includes `claw.exe`, Git, fd, rg, config files, and the installation script |
 | `claw.exe` | [Download here](https://github.com/huagusam/clawcode/releases/download/v0.2.2.1/claw.exe) | Standalone main binary (optional; already bundled in the installer package) |
 
-> We recommend simply downloading **`Config_methods.zip`** — a single file completes the full installation.
+> We recommend simply downloading **`Config_methods.7z`** — a single file completes the full installation.
 
 ## 2. Extract
 
-1. Right-click `Config_methods.zip` → **Extract All** (built into Windows; install [7-Zip](https://www.7-zip.org/) if not available)
+1. Right-click `Config_methods.7z` → **Extract All** (built into Windows; install [7-Zip](https://www.7-zip.org/) if not available)
 2. After extraction you get the `Install_Config_methods` folder containing:
    - `claw.exe` — main binary
    - `Git.7z` — offline Git Bash installer
