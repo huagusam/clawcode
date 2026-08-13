@@ -12,8 +12,20 @@ use crate::compression_config::CompressionConfig;
 use crate::session::{ContentBlock, ConversationMessage};
 
 /// Tools whose output should be compressed in subsequent API rounds.
+/// `Agent` / `Skill` results carry the full sub-agent (or skill) final text;
+/// compressing them once they fall outside the recent-message window prevents
+/// the parent loop from re-transmitting the whole delegation output on every
+/// later iteration.
 const FILTER_TOOLS: &[&str] = &[
-    "WebFetch", "WebSearch", "read_file", "new_file", "edit_file", "bash", "grep_search",
+    "WebFetch",
+    "WebSearch",
+    "read_file",
+    "new_file",
+    "edit_file",
+    "bash",
+    "grep_search",
+    "Agent",
+    "Skill",
 ];
 
 /// Check whether a time-sensitive tool result has exceeded its TTL.

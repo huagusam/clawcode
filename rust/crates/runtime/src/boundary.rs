@@ -111,7 +111,8 @@ pub trait Prompter: Send + Sync {
 /// Active boundary policy. `Prompt` (the default) asks the human
 /// through a `Prompter` for out-of-workspace access. `Block` rejects
 /// every out-of-workspace access silently. `Allow` grants all
-/// out-of-workspace access silently.
+/// out-of-workspace access silently. `ExternalReadOnly` grants reads
+/// silently but prompts for writes.
 #[derive(Clone)]
 pub enum BoundaryPolicy {
     /// Reject every out-of-workspace access (default).
@@ -121,6 +122,15 @@ pub enum BoundaryPolicy {
     /// `user_typed` and bypass the prompt — the act of naming a path
     /// is a strong, intentional trust signal.
     Prompt {
+        prompter: Arc<dyn Prompter>,
+        session_approved: Arc<std::sync::Mutex<BTreeSet<ApprovedRoot>>>,
+        user_typed: Arc<std::sync::Mutex<BTreeSet<ApprovedRoot>>>,
+    },
+    /// Out-of-workspace reads are granted silently (like `Allow`);
+    /// out-of-workspace writes go through the same prompt machinery as
+    /// `Prompt`. Used by `yolo` mode, which is workspace-write base
+    /// with a read-only view of the rest of the filesystem.
+    ExternalReadOnly {
         prompter: Arc<dyn Prompter>,
         session_approved: Arc<std::sync::Mutex<BTreeSet<ApprovedRoot>>>,
         user_typed: Arc<std::sync::Mutex<BTreeSet<ApprovedRoot>>>,
@@ -140,6 +150,15 @@ impl std::fmt::Debug for BoundaryPolicy {
         match self {
             Self::Block => f.write_str("Block"),
             Self::Allow => f.write_str("Allow"),
+            Self::ExternalReadOnly {
+                session_approved,
+                user_typed,
+                ..
+            } => f
+                .debug_struct("ExternalReadOnly")
+                .field("session_approved", &session_approved.lock().map(|s| s.len()).unwrap_or(0))
+                .field("user_typed", &user_typed.lock().map(|s| s.len()).unwrap_or(0))
+                .finish(),
             Self::Prompt { session_approved, user_typed, .. } => f
                 .debug_struct("Prompt")
                 .field("session_approved", &session_approved.lock().map(|s| s.len()).unwrap_or(0))
@@ -156,6 +175,7 @@ impl std::fmt::Debug for BoundaryPolicy {
 pub enum BoundaryPolicyKind {
     Block,
     Prompt,
+    ExternalReadOnly,
     Allow,
 }
 
@@ -164,6 +184,7 @@ impl BoundaryPolicyKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "block" | "strict" | "default" => Some(Self::Block),
             "prompt" | "ask" => Some(Self::Prompt),
+            "external-readonly" | "external-read-only" | "yolo" => Some(Self::ExternalReadOnly),
             "allow" | "permissive" | "off" => Some(Self::Allow),
             _ => None,
         }
@@ -186,6 +207,15 @@ impl BoundaryCheck {
     pub fn is_inside(&self) -> bool {
         matches!(self, BoundaryCheck::InWorkspace)
     }
+}
+
+/// Kind of access being requested against an out-of-workspace path.
+/// Policies like `ExternalReadOnly` distinguish reads (granted
+/// silently) from writes (subject to the prompt machinery).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundaryOperation {
+    Read,
+    Write,
 }
 
 /// Best-effort canonicalization for a path that may not yet exist on
@@ -261,11 +291,14 @@ impl PolicyOutcome {
 impl BoundaryPolicy {
     /// Apply the policy to a path that is already known to be
     /// out-of-workspace. The caller supplies the canonical paths so
-    /// that audit records and prompt messages are stable.
+    /// that audit records and prompt messages are stable, and the
+    /// operation kind so read-only policies can distinguish reads
+    /// from writes.
     pub fn enforce_outside(
         &self,
         canonical_path: &Path,
         canonical_workspace: &Path,
+        operation: BoundaryOperation,
     ) -> PolicyOutcome {
         // Normalize Windows long-path prefixes so comparisons
         // against paths stored via note_user_path (also uses
@@ -288,83 +321,127 @@ impl BoundaryPolicy {
                     .unwrap_or(canonical_path)
                     .to_path_buf(),
             },
-            BoundaryPolicy::Prompt {
+            BoundaryPolicy::ExternalReadOnly {
                 prompter,
                 session_approved,
                 user_typed,
             } => {
-                // User-typed paths have the strongest trust signal:
-                // the human *named* the path in input. Always allow
-                // without re-prompting, but record the decision so
-                // audit logs and tests can observe the trust grant.
-                if let Ok(set) = user_typed.lock() {
-                    if let Some(parent) = canonical_path.parent() {
-                        if set.iter().any(|root| {
-                            parent.starts_with(dunce::simplified(root.as_path()))
-                        }) {
-                            return PolicyOutcome::Approved {
-                                decision: BoundaryDecision::AllowAlways,
-                                approved_root: parent.to_path_buf(),
-                            };
-                        }
-                    }
-                }
-                if let Ok(set) = session_approved.lock() {
-                    if let Some(parent) = canonical_path.parent() {
-                        if set.iter().any(|root| {
-                            parent.starts_with(dunce::simplified(root.as_path()))
-                        }) {
-                            return PolicyOutcome::Approved {
-                                decision: BoundaryDecision::AllowAlways,
-                                approved_root: parent.to_path_buf(),
-                            };
-                        }
-                    }
-                }
-                match prompter.ask(canonical_path, canonical_workspace) {
-                    Ok(BoundaryDecision::AllowOnce) => PolicyOutcome::Approved {
+                if operation == BoundaryOperation::Read {
+                    // Reads outside the workspace are granted silently —
+                    // the "readonly" half of the external view.
+                    return PolicyOutcome::Approved {
                         decision: BoundaryDecision::AllowOnce,
                         approved_root: canonical_path
                             .parent()
                             .unwrap_or(canonical_path)
                             .to_path_buf(),
-                    },
-                    Ok(BoundaryDecision::AllowAlways) => {
-                        let approved_root = canonical_path
-                            .parent()
-                            .unwrap_or(canonical_path)
-                            .to_path_buf();
-                        if let Ok(mut set) = session_approved.lock() {
-                            set.insert(ApprovedRoot::new(approved_root.clone()));
-                        }
-                        PolicyOutcome::Approved {
-                            decision: BoundaryDecision::AllowAlways,
-                            approved_root,
-                        }
-                    }
-                    // AllowPermanent was removed — use AllowAlways instead
-                    Ok(BoundaryDecision::Deny) | Err(_) => PolicyOutcome::Denied(format!(
-                        "user denied access to {} (workspace {})",
-                        canonical_path.display(),
-                        canonical_workspace.display(),
-                    )),
+                    };
+                }
+                Self::enforce_prompt(
+                    prompter,
+                    session_approved,
+                    user_typed,
+                    canonical_path,
+                    canonical_workspace,
+                )
+            }
+            BoundaryPolicy::Prompt {
+                prompter,
+                session_approved,
+                user_typed,
+            } => Self::enforce_prompt(
+                prompter,
+                session_approved,
+                user_typed,
+                canonical_path,
+                canonical_workspace,
+            ),
+        }
+    }
+
+    /// Shared out-of-workspace write-approval flow used by the `Prompt`
+    /// and `ExternalReadOnly` policies: user-typed paths bypass the
+    /// prompter entirely, session-approved paths are reused, and
+    /// anything else goes to the human.
+    fn enforce_prompt(
+        prompter: &Arc<dyn Prompter>,
+        session_approved: &Arc<std::sync::Mutex<BTreeSet<ApprovedRoot>>>,
+        user_typed: &Arc<std::sync::Mutex<BTreeSet<ApprovedRoot>>>,
+        canonical_path: &Path,
+        canonical_workspace: &Path,
+    ) -> PolicyOutcome {
+        // User-typed paths have the strongest trust signal:
+        // the human *named* the path in input. Always allow
+        // without re-prompting, but record the decision so
+        // audit logs and tests can observe the trust grant.
+        if let Ok(set) = user_typed.lock() {
+            if let Some(parent) = canonical_path.parent() {
+                if set.iter().any(|root| {
+                    parent.starts_with(dunce::simplified(root.as_path()))
+                }) {
+                    return PolicyOutcome::Approved {
+                        decision: BoundaryDecision::AllowAlways,
+                        approved_root: parent.to_path_buf(),
+                    };
                 }
             }
+        }
+        if let Ok(set) = session_approved.lock() {
+            if let Some(parent) = canonical_path.parent() {
+                if set.iter().any(|root| {
+                    parent.starts_with(dunce::simplified(root.as_path()))
+                }) {
+                    return PolicyOutcome::Approved {
+                        decision: BoundaryDecision::AllowAlways,
+                        approved_root: parent.to_path_buf(),
+                    };
+                }
+            }
+        }
+        match prompter.ask(canonical_path, canonical_workspace) {
+            Ok(BoundaryDecision::AllowOnce) => PolicyOutcome::Approved {
+                decision: BoundaryDecision::AllowOnce,
+                approved_root: canonical_path
+                    .parent()
+                    .unwrap_or(canonical_path)
+                    .to_path_buf(),
+            },
+            Ok(BoundaryDecision::AllowAlways) => {
+                let approved_root = canonical_path
+                    .parent()
+                    .unwrap_or(canonical_path)
+                    .to_path_buf();
+                if let Ok(mut set) = session_approved.lock() {
+                    set.insert(ApprovedRoot::new(approved_root.clone()));
+                }
+                PolicyOutcome::Approved {
+                    decision: BoundaryDecision::AllowAlways,
+                    approved_root,
+                }
+            }
+            // AllowPermanent was removed — use AllowAlways instead
+            Ok(BoundaryDecision::Deny) | Err(_) => PolicyOutcome::Denied(format!(
+                "user denied access to {} (workspace {})",
+                canonical_path.display(),
+                canonical_workspace.display(),
+            )),
         }
     }
 
     /// Record that the user explicitly named a path in input (drag-
-    /// drop, paste, type). In `Prompt` mode this pre-trusts the
-    /// path's parent directory so the LLM can read it without
-    /// prompting. In `Block` and `Allow` modes this is a no-op:
-    /// the policy already has a fixed answer for every path.
+    /// drop, paste, type). In `Prompt` and `ExternalReadOnly` modes
+    /// this pre-trusts the path's parent directory so the LLM can read
+    /// it without prompting. In `Block` and `Allow` modes this is a
+    /// no-op: the policy already has a fixed answer for every path.
     ///
     /// We trust the *parent* directory (not just the file) so the
     /// LLM can read sibling files without re-prompting. If the user
     /// typed a directory path, we trust the directory itself so
     /// descendants are accessible.
     pub fn note_user_path(&self, path: &Path) {
-        if let BoundaryPolicy::Prompt { user_typed, .. } = self {
+        if let BoundaryPolicy::Prompt { user_typed, .. }
+        | BoundaryPolicy::ExternalReadOnly { user_typed, .. } = self
+        {
             let canonical = dunce::simplified(
                 &path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
             )
@@ -386,7 +463,9 @@ impl BoundaryPolicy {
     /// Count of paths the user has explicitly named in input.
     /// Primarily for tests and `claw status` output.
     pub fn user_typed_count(&self) -> usize {
-        if let BoundaryPolicy::Prompt { user_typed, .. } = self {
+        if let BoundaryPolicy::Prompt { user_typed, .. }
+        | BoundaryPolicy::ExternalReadOnly { user_typed, .. } = self
+        {
             user_typed.lock().map(|s| s.len()).unwrap_or(0)
         } else {
             0
@@ -563,7 +642,8 @@ mod tests {
         let file = other.join("a.txt");
         std::fs::write(&file, "x").unwrap();
         let canonical = file.canonicalize().unwrap();
-        let outcome = BoundaryPolicy::Block.enforce_outside(&canonical, &ws);
+        let outcome =
+            BoundaryPolicy::Block.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         match outcome {
             PolicyOutcome::Denied(msg) => {
                 assert!(msg.contains("escapes workspace boundary"), "msg: {msg}");
@@ -581,13 +661,74 @@ mod tests {
         let file = other.join("a.txt");
         std::fs::write(&file, "x").unwrap();
         let canonical = file.canonicalize().unwrap();
-        let outcome = BoundaryPolicy::Allow.enforce_outside(&canonical, &ws);
+        let outcome =
+            BoundaryPolicy::Allow.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         match outcome {
             PolicyOutcome::Approved { decision, .. } => {
                 assert_eq!(decision, BoundaryDecision::AllowOnce);
             }
             other => panic!("expected Approved, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn external_read_only_allows_reads_without_prompting() {
+        let ws = temp_dir("ero-read-ws");
+        let other = temp_dir("ero-read-other");
+        let file = other.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let canonical = file.canonicalize().unwrap();
+        // Empty scripted prompter: a read must be admitted WITHOUT asking,
+        // so any prompter consultation would surface NoTty -> Denied.
+        let prompter = Arc::new(ScriptedPrompter::new(vec![]));
+        let session = Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new()));
+        let policy = BoundaryPolicy::ExternalReadOnly {
+            prompter: prompter.clone(),
+            session_approved: session.clone(),
+            user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
+        };
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
+        match outcome {
+            PolicyOutcome::Approved { decision, .. } => {
+                assert_eq!(decision, BoundaryDecision::AllowOnce);
+            }
+            other => panic!("expected Approved(AllowOnce) for read, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn external_read_only_prompts_for_writes() {
+        let ws = temp_dir("ero-write-ws");
+        let other = temp_dir("ero-write-other");
+        let file = other.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let canonical = file.canonicalize().unwrap();
+        // A write must consult the prompter: AllowOnce admits, Deny blocks.
+        let prompter = Arc::new(ScriptedPrompter::new(vec![BoundaryDecision::AllowOnce]));
+        let session = Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new()));
+        let policy = BoundaryPolicy::ExternalReadOnly {
+            prompter: prompter.clone(),
+            session_approved: session.clone(),
+            user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
+        };
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Write);
+        assert!(matches!(
+            outcome,
+            PolicyOutcome::Approved { decision: BoundaryDecision::AllowOnce, .. }
+        ));
+
+        let prompter = Arc::new(ScriptedPrompter::new(vec![BoundaryDecision::Deny]));
+        let policy = BoundaryPolicy::ExternalReadOnly {
+            prompter: prompter.clone(),
+            session_approved: session.clone(),
+            user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
+        };
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Write);
+        assert!(matches!(outcome, PolicyOutcome::Denied(_)));
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&other);
     }
@@ -606,7 +747,7 @@ mod tests {
             session_approved: session.clone(),
             user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
         };
-        let outcome = policy.enforce_outside(&canonical, &ws);
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         match outcome {
             PolicyOutcome::Approved { decision, .. } => {
                 assert_eq!(decision, BoundaryDecision::AllowOnce);
@@ -635,14 +776,14 @@ mod tests {
             session_approved: session.clone(),
             user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
         };
-        let outcome = policy.enforce_outside(&canonical, &ws);
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         assert!(matches!(
             outcome,
             PolicyOutcome::Approved { decision: BoundaryDecision::AllowAlways, .. }
         ));
         // A second access must NOT re-prompt because the session set
         // now contains the parent dir.
-        let outcome = policy.enforce_outside(&canonical, &ws);
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         assert!(matches!(
             outcome,
             PolicyOutcome::Approved { decision: BoundaryDecision::AllowAlways, .. }
@@ -668,7 +809,7 @@ mod tests {
             session_approved: session.clone(),
             user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
         };
-        let outcome = policy.enforce_outside(&canonical, &ws);
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         match outcome {
             PolicyOutcome::Denied(msg) => {
                 assert!(msg.contains("user denied access"), "msg: {msg}");
@@ -693,7 +834,7 @@ mod tests {
             session_approved: session.clone(),
             user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
         };
-        let outcome = policy.enforce_outside(&canonical, &ws);
+        let outcome = policy.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         assert!(matches!(outcome, PolicyOutcome::Denied(_)));
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&other);
@@ -712,6 +853,14 @@ mod tests {
             Some(BoundaryPolicyKind::Allow),
         );
         assert_eq!(BoundaryPolicyKind::parse("off"), Some(BoundaryPolicyKind::Allow));
+        assert_eq!(
+            BoundaryPolicyKind::parse("external-readonly"),
+            Some(BoundaryPolicyKind::ExternalReadOnly),
+        );
+        assert_eq!(
+            BoundaryPolicyKind::parse("yolo"),
+            Some(BoundaryPolicyKind::ExternalReadOnly),
+        );
         assert_eq!(BoundaryPolicyKind::parse(""), None);
         assert_eq!(BoundaryPolicyKind::parse("nonsense"), None);
     }
@@ -808,7 +957,7 @@ mod tests {
             session_approved: session.clone(),
             user_typed: Arc::new(std::sync::Mutex::new(BTreeSet::<ApprovedRoot>::new())),
         };
-        policy.enforce_outside(&canonical, &ws);
+        policy.enforce_outside(&canonical, &ws, BoundaryOperation::Read);
         let session_snapshot = session.lock().unwrap();
         assert_eq!(session_snapshot.len(), 1);
         drop(session_snapshot);
@@ -845,7 +994,7 @@ mod tests {
         // The script is empty: if `enforce_outside` had to consult
         // the prompter we would get `NoTty` -> `Denied`. Because the
         // path is in the user-typed set, we get `Approved` directly.
-        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws);
+        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws, BoundaryOperation::Read);
         assert!(matches!(
             outcome,
             PolicyOutcome::Approved { decision: BoundaryDecision::AllowAlways, .. }
@@ -872,7 +1021,7 @@ mod tests {
         // Any file inside the trusted directory should be allowed.
         let inside_file = other.join("inside.txt");
         std::fs::write(&inside_file, "x").unwrap();
-        let outcome = policy.enforce_outside(&inside_file.canonicalize().unwrap(), &ws);
+        let outcome = policy.enforce_outside(&inside_file.canonicalize().unwrap(), &ws, BoundaryOperation::Read);
         assert!(matches!(
             outcome,
             PolicyOutcome::Approved { decision: BoundaryDecision::AllowAlways, .. }
@@ -899,7 +1048,7 @@ mod tests {
             user_typed: user_typed.clone(),
         };
         policy.note_user_path(&typed_file);
-        let outcome = policy.enforce_outside(&sibling_file.canonicalize().unwrap(), &ws);
+        let outcome = policy.enforce_outside(&sibling_file.canonicalize().unwrap(), &ws, BoundaryOperation::Read);
         assert!(matches!(
             outcome,
             PolicyOutcome::Approved { decision: BoundaryDecision::AllowAlways, .. }
@@ -917,7 +1066,7 @@ mod tests {
         let policy = BoundaryPolicy::Block;
         policy.note_user_path(&file);
         // Even after `note_user_path`, Block must still reject.
-        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws);
+        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws, BoundaryOperation::Read);
         assert!(matches!(outcome, PolicyOutcome::Denied(_)));
         assert_eq!(policy.user_typed_count(), 0);
         let _ = std::fs::remove_dir_all(&ws);
@@ -933,7 +1082,7 @@ mod tests {
         let policy = BoundaryPolicy::Allow;
         policy.note_user_path(&file);
         // Allow mode already permits; `note_user_path` is harmless.
-        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws);
+        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws, BoundaryOperation::Read);
         assert!(matches!(outcome, PolicyOutcome::Approved { .. }));
         assert_eq!(policy.user_typed_count(), 0);
         let _ = std::fs::remove_dir_all(&ws);
@@ -991,7 +1140,7 @@ mod tests {
             .insert(ApprovedRoot::new(parent));
         // Both sets contain the relevant root; the outcome is still
         // `AllowAlways`. The prompter is NOT consulted.
-        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws);
+        let outcome = policy.enforce_outside(&file.canonicalize().unwrap(), &ws, BoundaryOperation::Read);
         assert!(matches!(
             outcome,
             PolicyOutcome::Approved { decision: BoundaryDecision::AllowAlways, .. }

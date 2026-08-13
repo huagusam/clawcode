@@ -43,6 +43,7 @@ pub fn load_plugin_agents(
                 subagent_type: fm.as_ref().and_then(|f| f.subagent_type.clone()),
                 tools: fm.as_ref().and_then(|f| f.tools.clone()),
                 skills: fm.as_ref().and_then(|f| f.skills.clone()),
+                permission: plugins::frontmatter::parse_permission_from_content(&contents),
                 source: DefinitionSource::Plugin,
                 shadowed_by: None,
                 plugin: Some(plugin_id.clone()),

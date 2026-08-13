@@ -171,6 +171,72 @@ pub fn parse_frontmatter(content: &str) -> Result<ParsedMarkdown<'_>, Frontmatte
     })
 }
 
+/// Parse `permission:` directives from an agent file's frontmatter **without**
+/// requiring `name`/`description`. The strict [`parse_frontmatter`] rejects
+/// files that omit `name` (e.g. `~/.claw/agents/architect.md`), which would
+/// silently discard the file's deny rules and let the sub-agent run with the
+/// full tool set. This lenient pass extracts the block so delegation can honor
+/// it regardless of `name`/`description` presence.
+///
+/// Expected block form:
+/// ```text
+/// permission:
+///   read: allow
+///   write: deny
+///   bash: deny
+/// ```
+/// The map is `tool-category → decision` (`allow`/`deny`/`ask`). A line that
+/// is not an indented `key: value` pair (blank line or a fresh top-level key)
+/// ends the block.
+#[must_use]
+pub fn parse_permission_from_content(
+    content: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let after_opener = &trimmed[3..];
+    let end = after_opener.find("\n---")?;
+    let yaml_section = &after_opener[..end];
+
+    let mut map = std::collections::BTreeMap::new();
+    let mut in_permission = false;
+    for line in yaml_section.lines() {
+        if !in_permission {
+            let stripped = line.trim_start();
+            if let Some(rest) = stripped.strip_prefix("permission:") {
+                if rest.trim().is_empty() {
+                    in_permission = true;
+                }
+            }
+            continue;
+        }
+        if line.trim().is_empty() {
+            in_permission = false;
+            continue;
+        }
+        // A fresh top-level key (no leading whitespace) ends the block.
+        if !line.starts_with(|c: char| c.is_whitespace()) {
+            in_permission = false;
+            continue;
+        }
+        if let Some((key, value)) = line.trim().split_once(':') {
+            let key = key.trim();
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if !key.is_empty() && !value.is_empty() {
+                map.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
 fn flush_multiline(
     key: &str,
     lines: &[String],
@@ -378,5 +444,33 @@ mod tests {
             result.map(|p| p.frontmatter.name),
             Err(FrontmatterError::MissingField("name"))
         ));
+    }
+
+    #[test]
+    fn parse_permission_block_without_name() {
+        // architect.md-style file: no `name:`, but a `permission:` block that
+        // the strict parser would reject wholesale.
+        let content = "---\ndescription: An architect\npermission:\n  read: allow\n  write: deny\n  bash: deny\n---\nbody";
+        let permission = parse_permission_from_content(content).expect("block parsed");
+        assert_eq!(permission.get("read").map(String::as_str), Some("allow"));
+        assert_eq!(permission.get("write").map(String::as_str), Some("deny"));
+        assert_eq!(permission.get("bash").map(String::as_str), Some("deny"));
+        assert_eq!(permission.len(), 3);
+    }
+
+    #[test]
+    fn parse_permission_stops_at_next_top_level_key() {
+        let content = "---\npermission:\n  read: allow\nname: my-agent\ndescription: d\n---\nbody";
+        let permission = parse_permission_from_content(content).expect("block parsed");
+        assert_eq!(permission.len(), 1);
+        assert_eq!(permission.get("read").map(String::as_str), Some("allow"));
+    }
+
+    #[test]
+    fn parse_permission_none_when_absent_or_broken() {
+        assert!(parse_permission_from_content("no frontmatter").is_none());
+        assert!(parse_permission_from_content("---\nname: x\ndescription: y\n---\nbody").is_none());
+        // `permission:` with an inline value (not the block form) yields nothing.
+        assert!(parse_permission_from_content("---\npermission: deny\nname: x\ndescription: y\n---\nbody").is_none());
     }
 }

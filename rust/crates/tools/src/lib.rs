@@ -210,11 +210,11 @@ pub fn active_workspace_policy() -> BoundaryPolicy {
 }
 
 /// Record that the user explicitly named a path in input. In
-/// `Prompt` mode, this pre-trusts the path's parent directory so the
-/// LLM can read it without prompting. In `Block` and `Allow` modes
-/// this is a no-op: the policy already has a fixed answer for every
-/// path. Designed to be called from the input parser whenever it
-/// detects an absolute path in user input.
+/// `Prompt`/`ExternalReadOnly` mode, this pre-trusts the path's
+/// parent directory so the LLM can read it without prompting. In
+/// `Block` and `Allow` modes this is a no-op: the policy already has
+/// a fixed answer for every path. Designed to be called from the
+/// input parser whenever it detects an absolute path in user input.
 pub fn note_user_input_path(path: &Path) {
     global_workspace_policy().get().note_user_path(path);
 }
@@ -223,6 +223,58 @@ pub fn note_user_input_path(path: &Path) {
 /// for tests and `claw status` output.
 pub fn user_typed_path_count() -> usize {
     global_workspace_policy().get().user_typed_count()
+}
+
+/// Process-global active permission mode. Mirrors [`ActiveBoundaryPolicy`]:
+/// the CLI writes the session's mode here at startup and on `/permissions`
+/// changes, and sub-agent spawns read it so a sub-agent inherits the same
+/// permission regime as its parent (permission passthrough). The default is
+/// `Yolo` so spawns from contexts that never set it run under the yolo
+/// regime (workspace-write base + external read-only + others ask).
+pub struct ActivePermissionMode {
+    cell: std::sync::Mutex<PermissionMode>,
+}
+
+impl ActivePermissionMode {
+    pub const fn new() -> Self {
+        Self {
+            cell: std::sync::Mutex::new(PermissionMode::Yolo),
+        }
+    }
+
+    /// Replace the active mode. Returns the previous mode so callers
+    /// can restore it (handy in tests).
+    pub fn set(&self, mode: PermissionMode) -> PermissionMode {
+        let mut guard = self.cell.lock().expect("permission mode mutex poisoned");
+        std::mem::replace(&mut *guard, mode)
+    }
+
+    /// Snapshot the active mode.
+    pub fn get(&self) -> PermissionMode {
+        *self
+            .cell
+            .lock()
+            .expect("permission mode mutex poisoned")
+    }
+}
+
+fn global_permission_mode() -> &'static ActivePermissionMode {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<ActivePermissionMode> = OnceLock::new();
+    MODE.get_or_init(ActivePermissionMode::new)
+}
+
+/// Override the active permission mode. Returns the previous mode so
+/// callers can restore it. Used by the CLI at startup and on
+/// `/permissions` changes so sub-agents inherit the session's mode.
+pub fn set_active_permission_mode(mode: PermissionMode) -> PermissionMode {
+    global_permission_mode().set(mode)
+}
+
+/// Snapshot of the active permission mode. Read by sub-agent spawns to
+/// implement permission passthrough (sub-agent mode == parent mode).
+pub fn active_permission_mode() -> PermissionMode {
+    global_permission_mode().get()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,6 +591,7 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     match value {
         "read-only" => Ok(PermissionMode::ReadOnly),
         "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+        "yolo" => Ok(PermissionMode::Yolo),
         "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
         other => Err(format!("unsupported plugin permission: {other}")),
     }
@@ -2043,6 +2096,65 @@ mod tests {
     }
 
     #[test]
+    fn diag_subagent_executor_read_file_with_code_explorer_permission() {
+        // TEMPORARY diagnostic: reproduce the user-reported "can't read files"
+        // regression using code-explorer.md's exact permission directives with
+        // the real registered tool executor.
+        use agents::SubagentToolExecutor;
+        use runtime::PermissionMode;
+
+        let _guard = env_guard();
+        tools_init().expect("tools_init should register the executor");
+        // Simulate in-workspace reads: the workspace boundary must not be what
+        // blocks the file tools in this diagnostic.
+        let prev = super::set_active_workspace_policy(runtime::BoundaryPolicy::Allow);
+
+        let mut allowed = BTreeSet::new();
+        for t in [
+            "bash", "read_file", "new_file", "edit_file", "glob_search",
+            "grep_search", "WebFetch", "WebSearch", "Skill", "StructuredOutput",
+        ] {
+            allowed.insert(t.to_string());
+        }
+        // code-explorer.md permission:
+        //   read/glob/grep/bash/task/skill: allow, write/edit/webfetch/todowrite: deny
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_allow_all("read_file")
+            .with_allow_all("bash")
+            .with_allow_all("glob_search")
+            .with_allow_all("grep_search")
+            .with_allow_all("Skill")
+            .with_deny_all("new_file")
+            .with_deny_all("edit_file")
+            .with_deny_all("WebFetch");
+        let mut exec = SubagentToolExecutor::new(allowed).with_permission_policy(policy);
+
+        let root = std::env::temp_dir().join(format!("claw-diag-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("sample.rs");
+        fs::write(&file, "fn main() {}\n").expect("write fixture");
+
+        let read = exec.execute(
+            "read_file",
+            &format!(r#"{{"path": {}}}"#, serde_json::to_string(&file.display().to_string()).unwrap()),
+        );
+        eprintln!("[diag] read_file -> {read:?}");
+        assert!(
+            read.is_ok(),
+            "read_file must NOT be denied by code-explorer permission; got: {read:?}"
+        );
+
+        let bash = exec.execute("bash", r#"{"command":"echo ok"}"#);
+        eprintln!("[diag] bash -> {bash:?}");
+        assert!(bash.is_ok(), "bash must be allowed; got: {bash:?}");
+
+        super::set_active_workspace_policy(prev);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn tools_init_is_idempotent() {
         let _guard = env_guard();
 
@@ -2840,6 +2952,7 @@ mod tests {
                 allowed_tools: None,
                 mode: None,
                 reasoning_effort: None,
+                permission: None,
             },
             move |job| {
                 let agent_id = job.manifest.agent_id.clone();
@@ -2874,6 +2987,7 @@ mod tests {
                 allowed_tools: None,
                 mode: None,
                 reasoning_effort: None,
+                permission: None,
             },
             |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
         )
@@ -2891,6 +3005,7 @@ mod tests {
                 allowed_tools: None,
                 mode: None,
                 reasoning_effort: None,
+                permission: None,
             },
             |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
         )
@@ -2915,6 +3030,7 @@ mod tests {
                 allowed_tools: None,
                 mode: None,
                 reasoning_effort: Some("high".to_string()),
+                permission: None,
             },
             move |job| {
                 let agent_id = job.manifest.agent_id.clone();
@@ -2961,6 +3077,7 @@ mod tests {
                     allowed_tools: None,
                     mode: None,
                     reasoning_effort: None,
+                    permission: None,
                 },
                 |job| Ok(AgentHandle::noop(job.manifest.agent_id.clone())),
             )
@@ -3004,6 +3121,7 @@ mod tests {
                 allowed_tools: None,
                 mode: None,
                 reasoning_effort: None,
+                permission: None,
             },
             move |job| {
                 let agent_id = job.manifest.agent_id.clone();
@@ -3041,6 +3159,7 @@ mod tests {
                 allowed_tools: None,
                 mode: None,
                 reasoning_effort: None,
+                permission: None,
             },
             move |job| {
                 let agent_id = job.manifest.agent_id.clone();
@@ -3615,6 +3734,146 @@ mod tests {
     }
 
     #[test]
+    fn yolo_mode_external_readonly_real_file_io() {
+        // Real end-to-end file I/O under the yolo regime
+        // (workspace-write base + external read-only + others ask):
+        //   - in-workspace write succeeds
+        //   - external read succeeds silently (no prompter consulted)
+        //   - external write is denied (NoTty prompter => ask falls back)
+        //   - in-workspace edit succeeds
+        let _guard = env_guard();
+
+        // Install the yolo boundary policy: reads outside workspace are
+        // granted silently, writes consult the (empty) prompter which
+        // surfaces NoTty -> denied.
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+        let prompter = Arc::new(EmptyPrompter);
+        let session = Arc::new(Mutex::new(BTreeSet::<runtime::ApprovedRoot>::new()));
+        let user_typed = Arc::new(Mutex::new(BTreeSet::<runtime::ApprovedRoot>::new()));
+        let policy = runtime::BoundaryPolicy::ExternalReadOnly {
+            prompter,
+            session_approved: session,
+            user_typed,
+        };
+        let prev_policy = super::set_active_workspace_policy(policy);
+        let prev_mode = super::set_active_permission_mode(runtime::PermissionMode::Yolo);
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "clawd-yolo-ws-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let outside_dir = std::env::temp_dir().join(format!(
+            "clawd-yolo-out-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace dir should create");
+        fs::create_dir_all(&outside_dir).expect("outside dir should create");
+        let outside_file = outside_dir.join("external.txt");
+        fs::write(&outside_file, "external data").expect("external file should write");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace_root).expect("set cwd");
+
+        // 1. In-workspace write: allowed.
+        let in_ws_path = workspace_root.join("in.txt");
+        let write = super::run_new_file(super::WriteFileInput {
+            path: in_ws_path.to_string_lossy().into_owned(),
+            content: "workspace content".to_string(),
+            force: Some(false),
+        });
+        assert!(write.is_ok(), "in-workspace write must succeed: {write:?}");
+
+        // 2. External read: allowed silently even though the prompter is
+        // empty (any prompt consult would surface NoTty -> denied).
+        let read = super::run_read_file(super::ReadFileInput {
+            path: outside_file.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+            full: Some(true),
+        });
+        let read = read.expect("external read must be admitted in yolo mode");
+        assert!(read.contains("external data"), "read payload: {read}");
+
+        // 3. External write: denied (ask falls back to NoTty).
+        let external_write = super::run_new_file(super::WriteFileInput {
+            path: outside_dir.join("new.txt").to_string_lossy().into_owned(),
+            content: "should be blocked".to_string(),
+            force: Some(false),
+        });
+        assert!(
+            external_write.is_err(),
+            "external write must be denied in yolo mode: {external_write:?}"
+        );
+        assert!(!outside_dir.join("new.txt").exists(), "external file must not exist");
+
+        // 4. In-workspace edit: allowed.
+        let edit = super::run_edit_file(super::EditFileInput {
+            path: in_ws_path.to_string_lossy().into_owned(),
+            old_string: "workspace content".to_string(),
+            new_string: "workspace content v2".to_string(),
+            replace_all: Some(false),
+            expected_checksum: None,
+        });
+        assert!(edit.is_ok(), "in-workspace edit must succeed: {edit:?}");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace_root);
+        let _ = fs::remove_dir_all(&outside_dir);
+
+        // Restore globals before assertions so a panic cannot poison
+        // sibling tests.
+        super::set_active_workspace_policy(prev_policy);
+        super::set_active_permission_mode(prev_mode);
+    }
+
+    #[test]
+    fn allow_policy_permits_external_writes_real_file_io() {
+        // Full access (CLAW_WORKSPACE_POLICY=allow / danger-full-access):
+        // unlike yolo, external writes are granted silently too.
+        let _guard = env_guard();
+        let prev_policy = super::set_active_workspace_policy(runtime::BoundaryPolicy::Allow);
+        let prev_mode = super::set_active_permission_mode(runtime::PermissionMode::DangerFullAccess);
+
+        let outside_dir = std::env::temp_dir().join(format!(
+            "clawd-allow-write-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).expect("outside dir should create");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&std::env::temp_dir()).expect("set cwd");
+
+        let write = super::run_new_file(super::WriteFileInput {
+            path: outside_dir.join("written.txt").to_string_lossy().into_owned(),
+            content: "full access content".to_string(),
+            force: Some(false),
+        });
+        assert!(
+            write.is_ok(),
+            "external write must be allowed under full access: {write:?}"
+        );
+        assert!(
+            outside_dir.join("written.txt").exists(),
+            "external file must exist under full access"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&outside_dir);
+        super::set_active_workspace_policy(prev_policy);
+        super::set_active_permission_mode(prev_mode);
+    }
+
+    #[test]
     fn set_active_workspace_policy_returns_previous_value() {
         let _guard = env_guard();
         let strict = runtime::BoundaryPolicy::Block;
@@ -3627,6 +3886,17 @@ mod tests {
         assert!(matches!(prev_after, runtime::BoundaryPolicy::Block));
         // Restore.
         let _ = super::set_active_workspace_policy(prev);
+    }
+
+    #[test]
+    fn active_permission_mode_defaults_to_yolo() {
+        let _guard = env_guard();
+        // Permission passthrough: sub-agents spawn under the parent's mode.
+        // The default is yolo so spawns from contexts that never set the
+        // mode still run under the yolo regime.
+        let original = super::set_active_permission_mode(runtime::PermissionMode::ReadOnly);
+        assert_eq!(super::active_permission_mode(), runtime::PermissionMode::ReadOnly);
+        let _ = super::set_active_permission_mode(original);
     }
 
     #[test]
@@ -4506,7 +4776,11 @@ fn transactional_undo_patches(
     .to_path_buf();
     let check = runtime::boundary::classify_boundary(&canonical, &canonical_root);
     if matches!(check, runtime::boundary::BoundaryCheck::OutOfWorkspace { .. }) {
-        match policy.enforce_outside(&canonical, &canonical_root) {
+        match policy.enforce_outside(
+            &canonical,
+            &canonical_root,
+            runtime::boundary::BoundaryOperation::Write,
+        ) {
             runtime::boundary::PolicyOutcome::Proceed
             | runtime::boundary::PolicyOutcome::Approved { .. } => {}
             runtime::boundary::PolicyOutcome::Denied(msg) => {
@@ -5455,6 +5729,7 @@ where
         model: Some(resolve_agent_model(input.model.as_deref())),
         mode: input.mode.clone(),
         reasoning_effort: input.reasoning_effort.clone(),
+        permission: input.permission.clone(),
         status: Some("Running".to_string()),
         error: None,
         started_at: Some(now),
@@ -5484,6 +5759,8 @@ where
         manifest,
         prompt: input.prompt,
         reasoning_effort: input.reasoning_effort,
+        permission: input.permission,
+        permission_mode: active_permission_mode(),
         system_prompt,
         allowed_tools: {
             let mut allowed = input

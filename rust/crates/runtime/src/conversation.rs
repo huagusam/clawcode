@@ -910,7 +910,16 @@ where
             pre_hook_result.permission_reason().map(ToOwned::to_owned),
         );
 
-        let permission_outcome = if self.forced_tool_ids.contains(&tool_use_id) {
+        // A forced tool-use id (deterministic `$skill` / `@agent` delegation)
+        // is auto-allowed so delegation stays non-interactive. That exemption
+        // must NOT swallow an explicit PreToolUse hook veto: a hook that
+        // cancels/fails/denies the delegation still blocks it, otherwise a
+        // forced id would silently elevate past every hook gate.
+        let permission_outcome = if self.forced_tool_ids.contains(&tool_use_id)
+            && !pre_hook_result.is_cancelled()
+            && !pre_hook_result.is_failed()
+            && !pre_hook_result.is_denied()
+        {
             PermissionOutcome::Allow
         } else if pre_hook_result.is_cancelled() {
             PermissionOutcome::Deny {

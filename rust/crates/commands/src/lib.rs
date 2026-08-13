@@ -110,7 +110,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show or switch the active permission mode",
         // read-only is hidden — consumed internally by sub-agent system.
         // See parse_permissions_mode() for details.
-        argument_hint: Some("[workspace-access|danger-full-access]"),
+        argument_hint: Some("[workspace-access|yolo|danger-full-access]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1446,21 +1446,25 @@ fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandP
     let mode = optional_single_arg(
         "permissions",
         args,
-        "[workspace-access|danger-full-access]",
+        "[workspace-access|yolo|danger-full-access]",
     )?;
     if let Some(mode) = mode {
         if matches!(
             mode.as_str(),
-            "read-only" | "workspace-write" | "workspace-access" | "danger-full-access"
+            "read-only"
+                | "workspace-write"
+                | "workspace-access"
+                | "yolo"
+                | "danger-full-access"
         ) {
             return Ok(Some(mode));
         }
         return Err(command_error(
             &format!(
-                "Unsupported /permissions mode '{mode}'. Use workspace-access or danger-full-access."
+                "Unsupported /permissions mode '{mode}'. Use workspace-access, yolo, or danger-full-access."
             ),
             "permissions",
-            "/permissions [workspace-access|danger-full-access]",
+            "/permissions [workspace-access|yolo|danger-full-access]",
         ));
     }
 
@@ -4222,10 +4226,10 @@ mod tests {
         // read-only is not shown in usage — consumed internally by sub-agent system.
         // See parse_permissions_mode() for details.
         assert!(error.contains(
-            "Unsupported /permissions mode 'admin'. Use workspace-access or danger-full-access."
+            "Unsupported /permissions mode 'admin'. Use workspace-access, yolo, or danger-full-access."
         ));
         assert!(error.contains(
-            "  Usage            /permissions [workspace-access|danger-full-access]"
+            "  Usage            /permissions [workspace-access|yolo|danger-full-access]"
         ));
     }
 
@@ -4320,7 +4324,7 @@ mod tests {
         assert!(help.contains("/model [model]"));
         // read-only is not shown in help — consumed internally by sub-agent system.
         // See parse_permissions_mode() for details.
-        assert!(help.contains("/permissions [workspace-access|danger-full-access]"));
+        assert!(help.contains("/permissions [workspace-access|yolo|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
@@ -4634,6 +4638,7 @@ mod tests {
                 subagent_type: None,
                 tools: None,
                 skills: None,
+                permission: None,
             },
             AgentSummary {
                 name: "planner".into(),
@@ -4647,6 +4652,7 @@ mod tests {
                 subagent_type: None,
                 tools: None,
                 skills: None,
+                permission: None,
             },
             AgentSummary {
                 name: "verifier".into(),
@@ -4660,6 +4666,7 @@ mod tests {
                 subagent_type: None,
                 tools: None,
                 skills: None,
+                permission: None,
             },
         ];
 
@@ -4695,6 +4702,7 @@ mod tests {
                 subagent_type: None,
                 tools: None,
                 skills: None,
+                permission: None,
             },
             AgentSummary {
                 name: "verifier".into(),
@@ -4708,6 +4716,7 @@ mod tests {
                 subagent_type: None,
                 tools: None,
                 skills: None,
+                permission: None,
             },
             AgentSummary {
                 name: "planner".into(),
@@ -4721,6 +4730,7 @@ mod tests {
                 subagent_type: None,
                 tools: None,
                 skills: None,
+                permission: None,
             },
         ];
 

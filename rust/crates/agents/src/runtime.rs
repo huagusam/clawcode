@@ -11,7 +11,7 @@ use api::{
 use runtime::{
     extract_embedded_tools, load_system_prompt,
     ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ConversationRuntime,
-    PermissionMode, PermissionPolicy, ProviderFallbackConfig,
+    PermissionMode, PermissionOutcome, PermissionPolicy, ProviderFallbackConfig,
     RuntimeError, Session, ThinkParser, ToolError, ToolExecutor,
 };
 use serde_json::Value;
@@ -476,6 +476,12 @@ async fn stream_with_provider(
                             // as clean text there, after embedded tools have
                             // been pulled out.
                             accumulated_visible.push_str(&visible);
+                            // Mirror the thinking-delta preview so the overlay
+                            // keeps refreshing while plain text streams.
+                            report_visible_text_progress(
+                                progress_reporter.as_ref(),
+                                &accumulated_visible,
+                            );
                         }
                         if !reasoning.is_empty() {
                             accumulated_thinking.push_str(&reasoning);
@@ -800,6 +806,21 @@ fn flush_thinking_block(
 
 
 
+/// Surface the sub-agent's visible text live in the progress overlay. Without
+/// this the overlay stops refreshing once thinking ends — `set_current_activity`
+/// is the only thing bumping `event_seq` during model streaming, so the elapsed
+/// timer freezes and the agent looks stuck while it is still generating text.
+fn report_visible_text_progress(
+    progress_reporter: Option<&(String, SharedProgress)>,
+    accumulated_visible: &str,
+) {
+    if let Some((agent_id, shared)) = progress_reporter {
+        let preview: String = accumulated_visible.chars().take(60).collect();
+        let clean = preview.replace(['\r', '\n'], " ");
+        set_current_activity(shared, agent_id, Some(format!("writing... {clean}")));
+    }
+}
+
 pub struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     policy: Option<PermissionPolicy>,
@@ -850,6 +871,21 @@ impl ToolExecutor for SubagentToolExecutor {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
+        }
+        // Belt-and-suspenders: the conversation loop already authorized this
+        // call, but re-check the policy here so a `permission:` deny directive
+        // cannot be bypassed by any path that reaches the executor directly.
+        // A sub-agent has no interactive prompter, so `ask` rules deny here
+        // too (matching the conversation layer's behavior with `None`).
+        if let Some(policy) = &self.policy {
+            if matches!(
+                policy.authorize(tool_name, input, None),
+                PermissionOutcome::Deny { .. }
+            ) {
+                return Err(ToolError::new(format!(
+                    "tool `{tool_name}` denied by the sub-agent permission policy"
+                )));
+            }
         }
         let value: Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
@@ -946,9 +982,19 @@ fn tool_specs_for_allowed_tools(
 // The 18-spec subset was the *permission-relevant* view; until the
 // PermissionMode filter criterion is decided (spec §11), callers see all 53.
 
-fn agent_permission_policy() -> PermissionPolicy {
+/// Build the sub-agent's permission policy.
+///
+/// Permission passthrough: the base mode is the parent session's active
+/// mode (threaded through `AgentJob::permission_mode`), so a sub-agent is
+/// constrained by exactly the same permission regime as its parent. The
+/// frontmatter `permission:` directives are no longer converted into hard
+/// allow/deny/ask rules — a `bash: deny` in an agent definition can no
+/// longer block a sub-agent from running a read-only command that the
+/// parent mode permits. Tool-requirement escalation (e.g. `bash` under
+/// `WorkspaceWrite`) still prompts under the inherited mode.
+fn agent_permission_policy(base_mode: PermissionMode) -> PermissionPolicy {
     runtime::tool_registry::mvp_tool_specs().into_iter().fold(
-        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        PermissionPolicy::new(base_mode),
         |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
     )
 }
@@ -1011,7 +1057,7 @@ pub fn build_agent_runtime_inner(
     let allowed_tools = job.allowed_tools.clone();
     let mut api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?
         .with_reasoning_effort(job.reasoning_effort.clone());
-    let permission_policy = agent_permission_policy();
+    let permission_policy = agent_permission_policy(job.permission_mode);
     let mut tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_permission_policy(permission_policy.clone());
 
@@ -1236,5 +1282,167 @@ mod tests {
             }
         }
         assert_eq!(names, vec!["bash", "read_file"]);
+    }
+
+    #[test]
+    fn visible_text_progress_keeps_overlay_alive() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        use crate::types::{new_shared_progress, AgentProgress};
+
+        let shared = new_shared_progress();
+        {
+            let mut guard = shared.agents.lock().unwrap_or_else(|e| e.into_inner());
+            guard.push(AgentProgress {
+                agent_id: "a1".to_string(),
+                name: "test".to_string(),
+                subagent_type: "general-purpose".to_string(),
+                status: AgentStatus::Running,
+                events: vec![],
+                started_at: std::time::Instant::now(),
+                iteration_count: 0,
+                final_event: None,
+                current_activity: None,
+            });
+        }
+
+        let seq_before = shared.event_seq.load(AtomicOrdering::Acquire);
+        report_visible_text_progress(
+            Some(&("a1".to_string(), shared.clone())),
+            "Let me inspect the build output",
+        );
+
+        let guard = shared.agents.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            guard[0].current_activity.as_deref(),
+            Some("writing... Let me inspect the build output"),
+            "plain text streaming must surface a live preview like thinking does"
+        );
+        let seq_after = shared.event_seq.load(AtomicOrdering::Acquire);
+        assert!(
+            seq_after > seq_before,
+            "event_seq must advance so the overlay re-renders and the elapsed timer moves"
+        );
+    }
+
+    #[test]
+    fn permission_policy_inherits_parent_mode() {
+        // Permission passthrough: the sub-agent policy uses the parent
+        // session's active mode as its base. Under DangerFullAccess every
+        // tool is allowed; frontmatter permission directives no longer
+        // translate into hard deny rules.
+        let policy = agent_permission_policy(PermissionMode::DangerFullAccess);
+        assert_eq!(
+            policy.authorize("read_file", r#"{"path":"/tmp/x"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("new_file", r#"{"path":"/workspace/x.rs"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"ls"}"#, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn permission_policy_restricts_under_read_only_parent() {
+        // Under a read-only parent mode, workspace writes are denied and
+        // reads are allowed — the sub-agent is constrained by the parent.
+        let policy = agent_permission_policy(PermissionMode::ReadOnly);
+        assert_eq!(
+            policy.authorize("read_file", r#"{"path":"/tmp/x"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("new_file", r#"{"path":"/workspace/x.rs"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"ls"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn permission_policy_yolo_auto_approves_work_and_asks_for_sensitive() {
+        // Yolo (workspace-write base + external readonly) permits workspace
+        // writes and auto-approves ordinary bash commands, but keeps
+        // dangerous/sensitive commands at DangerFullAccess; without a
+        // prompter that escalation is denied.
+        let policy = agent_permission_policy(PermissionMode::Yolo);
+        assert_eq!(
+            policy.authorize("new_file", r#"{"path":"/workspace/x.rs"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"ls"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"git status"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"cat /etc/passwd"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn diag_repro_read_agent_permission_files() {
+        // TEMPORARY diagnostic: reproduce the user-reported "can't read files"
+        // regression against the real agent definitions on disk.
+        use std::path::Path;
+        let dirs = [
+            r"C:\Users\Incredible\.claw\agents",
+            r"C:\Users\Incredible\AppData\Roaming\claw\agents",
+        ];
+        let mut checked = 0usize;
+        for dir in dirs {
+            let path = Path::new(dir);
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(path) else { continue };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(&p) else { continue };
+                let Some(perm) = plugins::frontmatter::parse_permission_from_content(&contents)
+                else {
+                    continue;
+                };
+                checked += 1;
+                let policy = agent_permission_policy(PermissionMode::DangerFullAccess);
+                let mut rows = Vec::new();
+                for (tool, input) in [
+                    ("read_file", r#"{"path":"/workspace/x.rs"}"#),
+                    ("bash", r#"{"command":"ls"}"#),
+                    ("glob_search", r#"{"pattern":"**/*.rs"}"#),
+                    ("grep_search", r#"{"pattern":"x"}"#),
+                    ("new_file", r#"{"path":"/workspace/x.rs"}"#),
+                    ("edit_file", r#"{"path":"/workspace/x.rs"}"#),
+                    ("WebFetch", r#"{"url":"https://example.com"}"#),
+                    ("Skill", r#"{"skill":"x"}"#),
+                ] {
+                    let o = policy.authorize(tool, input, None);
+                    let label = match o {
+                        PermissionOutcome::Allow => "ALLOW",
+                        PermissionOutcome::Deny { .. } => "DENY",
+                    };
+                    rows.push(format!("  {tool}: {label}"));
+                }
+                eprintln!(
+                    "\n### {} (perm keys: {})\n{}",
+                    p.file_name().unwrap_or_default().to_string_lossy(),
+                    perm.keys().cloned().collect::<Vec<_>>().join(","),
+                    rows.join("\n")
+                );
+            }
+        }
+        eprintln!("\n[diag] checked {checked} agent files with permission blocks");
     }
 }

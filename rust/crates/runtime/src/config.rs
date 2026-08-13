@@ -23,6 +23,7 @@ pub enum ConfigSource {
 pub enum ResolvedPermissionMode {
     ReadOnly,
     WorkspaceWrite,
+    Yolo,
     DangerFullAccess,
 }
 
@@ -961,6 +962,7 @@ fn parse_permission_mode_label(
     match mode {
         "default" | "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
         "acceptEdits" | "auto" | "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
+        "yolo" | "external-readonly" => Ok(ResolvedPermissionMode::Yolo),
         "dontAsk" | "bypassPermissions" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
         other => Err(ConfigError::Parse(format!(
             "{context}: unsupported permission mode {other}"
@@ -2106,6 +2108,15 @@ mod tests {
         assert_eq!(
             parse_permission_mode_label("acceptEdits", "test").expect("acceptEdits should resolve"),
             ResolvedPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            parse_permission_mode_label("yolo", "test").expect("yolo should resolve"),
+            ResolvedPermissionMode::Yolo
+        );
+        assert_eq!(
+            parse_permission_mode_label("external-readonly", "test")
+                .expect("external-readonly should resolve"),
+            ResolvedPermissionMode::Yolo
         );
         assert_eq!(
             parse_permission_mode_label("dontAsk", "test").expect("dontAsk should resolve"),

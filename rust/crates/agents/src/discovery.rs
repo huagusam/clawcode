@@ -75,6 +75,10 @@ pub struct AgentSummary {
     pub tools: Option<Vec<String>>,
     /// Declared skill references from frontmatter `skills:`.
     pub skills: Option<Vec<String>>,
+    /// Declared `permission:` directives (`tool-category → allow|deny|ask`).
+    /// Parsed leniently (does not require `name`/`description`), so deny
+    /// directives are honored even when the strict frontmatter parse fails.
+    pub permission: Option<BTreeMap<String, String>>,
 }
 
 impl AgentSummary {
@@ -251,6 +255,9 @@ fn load_agents_from_roots(
                             subagent_type: fm.as_ref().and_then(|f| f.subagent_type.clone()),
                             tools: fm.as_ref().and_then(|f| f.tools.clone()),
                             skills: fm.as_ref().and_then(|f| f.skills.clone()),
+                            permission: plugins::frontmatter::parse_permission_from_content(
+                                &contents,
+                            ),
                             source: *source,
                             shadowed_by: None,
                             plugin: None,
@@ -281,6 +288,9 @@ fn load_agents_from_roots(
                         subagent_type: fm.as_ref().and_then(|f| f.subagent_type.clone()),
                         tools: fm.as_ref().and_then(|f| f.tools.clone()),
                         skills: fm.as_ref().and_then(|f| f.skills.clone()),
+                        permission: plugins::frontmatter::parse_permission_from_content(
+                            &contents,
+                        ),
                         source: *source,
                         shadowed_by: None,
                         plugin: None,
@@ -306,6 +316,7 @@ fn load_agents_from_roots(
                     subagent_type: parse_toml_string(&contents, "subagent_type"),
                     tools: parse_toml_list(&contents, "tools"),
                     skills: parse_toml_list(&contents, "skills"),
+                    permission: parse_permission_toml(&contents),
                     source: *source,
                     shadowed_by: None,
                     plugin: None,
@@ -380,6 +391,40 @@ fn parse_toml_list(contents: &str, key: &str) -> Option<Vec<String>> {
         return Some(items);
     }
     None
+}
+
+/// Parse a TOML `[permission]` table like
+/// `[permission]` / `read = "allow"` / `write = "deny"` into the same
+/// `tool-category → decision` map used by the markdown frontmatter parser.
+fn parse_permission_toml(contents: &str) -> Option<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    let mut in_table = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_table = trimmed == "[permission]";
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if !key.is_empty() && !value.is_empty() {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
 }
 
 pub fn render_agents_report(agents: &[AgentSummary]) -> String {
@@ -494,5 +539,6 @@ fn agent_summary_json(agent: &AgentSummary) -> serde_json::Value {
         "active": agent.shadowed_by.is_none(),
         "shadowed_by": agent.shadowed_by.map(definition_source_json),
         "plugin": &agent.plugin,
+        "permission": &agent.permission,
     })
 }

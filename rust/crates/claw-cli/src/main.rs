@@ -758,7 +758,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let kind = runtime::BoundaryPolicyKind::parse(value).ok_or_else(|| {
                     format!(
                         "invalid --workspace-policy value: {value:?} \
-                         (expected: strict, prompt, allow)"
+                         (expected: strict, prompt, external-readonly, allow)"
                     )
                 })?;
                 workspace_policy_override = Some(kind);
@@ -769,7 +769,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let kind = runtime::BoundaryPolicyKind::parse(value).ok_or_else(|| {
                     format!(
                         "invalid --workspace-policy value: {value:?} \
-                         (expected: strict, prompt, allow)"
+                         (expected: strict, prompt, external-readonly, allow)"
                     )
                 })?;
                 workspace_policy_override = Some(kind);
@@ -888,17 +888,45 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     //   3. `Prompt` (default — ask outside workspace, like `/permissions workspace-access`)
     let is_tty = io::stdout().is_terminal() && io::stdin().is_terminal();
 
+    // The default boundary policy follows the permission mode when no
+    // explicit --workspace-policy / CLAW_WORKSPACE_POLICY override was
+    // given: yolo → external readonly, danger-full-access → allow,
+    // everything else → prompt.
+    let mut effective_permission_mode =
+        permission_mode_override.unwrap_or_else(default_permission_mode);
     let resolved_kind = workspace_policy_override
         .or_else(|| {
             env::var("CLAW_WORKSPACE_POLICY")
                 .ok()
                 .and_then(|v| runtime::BoundaryPolicyKind::parse(&v))
         })
-        .unwrap_or(runtime::BoundaryPolicyKind::Prompt);
+        .unwrap_or_else(|| match effective_permission_mode {
+            PermissionMode::Yolo => runtime::BoundaryPolicyKind::ExternalReadOnly,
+            PermissionMode::DangerFullAccess => runtime::BoundaryPolicyKind::Allow,
+            _ => runtime::BoundaryPolicyKind::Prompt,
+        });
+    // When the operator forces a permissive boundary via
+    // `CLAW_WORKSPACE_POLICY` (or `--workspace-policy`) without an explicit
+    // permission mode, promote the permission mode so the boundary policy
+    // and sub-agent permission passthrough agree on one regime:
+    //   allow              → danger-full-access (full access)
+    //   external-readonly  → yolo
+    if permission_mode_override.is_none() {
+        match resolved_kind {
+            runtime::BoundaryPolicyKind::Allow => {
+                effective_permission_mode = PermissionMode::DangerFullAccess;
+            }
+            runtime::BoundaryPolicyKind::ExternalReadOnly => {
+                effective_permission_mode = PermissionMode::Yolo;
+            }
+            _ => {}
+        }
+    }
     let resolved_policy = match resolved_kind {
         runtime::BoundaryPolicyKind::Block => runtime::BoundaryPolicy::Block,
         runtime::BoundaryPolicyKind::Allow => runtime::BoundaryPolicy::Allow,
-        runtime::BoundaryPolicyKind::Prompt => {
+        runtime::BoundaryPolicyKind::Prompt
+        | runtime::BoundaryPolicyKind::ExternalReadOnly => {
             let (ui_tx, ui_rx) = std::sync::mpsc::channel();
             if is_tty {
                 // UI thread only lives while the BoundaryPrompt channel is open.
@@ -906,14 +934,25 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 std::thread::spawn(move || permission_prompt::run_ui_thread(ui_rx));
             }
             let channel_prompter = permission_prompt::ChannelPrompter::new(ui_tx, is_tty);
-            runtime::BoundaryPolicy::Prompt {
-                prompter: Arc::new(channel_prompter),
-                session_approved: Arc::new(Mutex::new(BTreeSet::new())),
-                user_typed: Arc::new(Mutex::new(BTreeSet::new())),
+            let prompter: Arc<dyn runtime::Prompter> = Arc::new(channel_prompter);
+            match resolved_kind {
+                runtime::BoundaryPolicyKind::ExternalReadOnly => runtime::BoundaryPolicy::ExternalReadOnly {
+                    prompter,
+                    session_approved: Arc::new(Mutex::new(BTreeSet::new())),
+                    user_typed: Arc::new(Mutex::new(BTreeSet::new())),
+                },
+                _ => runtime::BoundaryPolicy::Prompt {
+                    prompter,
+                    session_approved: Arc::new(Mutex::new(BTreeSet::new())),
+                    user_typed: Arc::new(Mutex::new(BTreeSet::new())),
+                },
             }
         }
     };
     tools::set_active_workspace_policy(resolved_policy);
+    // Register the active permission mode so sub-agents spawned during the
+    // session inherit it (permission passthrough).
+    tools::set_active_permission_mode(effective_permission_mode);
 
     if wants_version {
         return Ok(CliAction::Version { output_format });
@@ -922,7 +961,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
     if rest.is_empty() {
-        let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        let permission_mode = permission_mode_override
+            .map_or(effective_permission_mode, |mode| mode);
         // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
@@ -965,12 +1005,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         &model,
         model_flag_raw.as_deref(),
         permission_mode_override,
+        effective_permission_mode,
         output_format,
     ) {
         return action;
     }
 
-    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+    let permission_mode = permission_mode_override
+        .map_or(effective_permission_mode, |mode| mode);
 
     match rest[0].as_str() {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
@@ -1163,6 +1205,7 @@ fn parse_single_word_command_alias(
     // #148: raw --model flag input for status provenance. None = no flag.
     model_flag_raw: Option<&str>,
     permission_mode_override: Option<PermissionMode>,
+    effective_permission_mode: PermissionMode,
     output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
     if rest.is_empty() {
@@ -1206,7 +1249,8 @@ fn parse_single_word_command_alias(
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
             model_flag_raw: model_flag_raw.map(str::to_string), // #148
-            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
+            permission_mode: permission_mode_override
+                .map_or(effective_permission_mode, |mode| mode),
             output_format,
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
@@ -1313,6 +1357,10 @@ struct MentionedAgent {
     reasoning_effort: Option<String>,
     allowed_tools: Option<Vec<String>>,
     subagent_type: Option<String>,
+    /// `permission:` directives from the agent file's frontmatter
+    /// (`tool-category → allow|deny|ask`). Honored by the spawned sub-agent's
+    /// policy; deny directives are effective even under `danger-full-access`.
+    permission: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Detect an `@agent` mention anywhere in the input and gather the data needed
@@ -1349,7 +1397,7 @@ fn detect_mentioned_agent(
     // mention casing, so the spawned agent's manifest and hint carry the
     // declared identity even when the user typed `@HELPER`.
     let resolved_name = matched.map_or_else(|| name.clone(), |a| a.name().to_string());
-    let (content, model, mode, reasoning_effort, allowed_tools, subagent_type) =
+    let (content, model, mode, reasoning_effort, allowed_tools, subagent_type, permission) =
         if let Some(agent) = matched {
             // Look up by the canonical frontmatter name first. find_agent_file
             // matches both the file stem and any frontmatter `name:`, so an
@@ -1362,7 +1410,17 @@ fn detect_mentioned_agent(
                 Some(file_content) => {
                     let (model, mode, reasoning_effort, tools, subagent_type) =
                         agent_frontmatter_model_mode(&file_content);
-                    (file_content, model, mode, reasoning_effort, tools, subagent_type)
+                    let permission =
+                        plugins::frontmatter::parse_permission_from_content(&file_content);
+                    (
+                        file_content,
+                        model,
+                        mode,
+                        reasoning_effort,
+                        tools,
+                        subagent_type,
+                        permission,
+                    )
                 }
                 None => (
                     agent.description().unwrap_or_default().to_string(),
@@ -1371,6 +1429,7 @@ fn detect_mentioned_agent(
                     agent.reasoning_effort.clone(),
                     agent.tools.clone(),
                     agent.subagent_type.clone(),
+                    None,
                 ),
             }
         } else {
@@ -1378,7 +1437,8 @@ fn detect_mentioned_agent(
                 .and_then(|p| read_agent_file_lossy(&p).ok())?;
             let (model, mode, reasoning_effort, tools, subagent_type) =
                 agent_frontmatter_model_mode(&file);
-            (file, model, mode, reasoning_effort, tools, subagent_type)
+            let permission = plugins::frontmatter::parse_permission_from_content(&file);
+            (file, model, mode, reasoning_effort, tools, subagent_type, permission)
         };
     let content = match content {
         content if !content.trim().is_empty() => content,
@@ -1394,6 +1454,7 @@ fn detect_mentioned_agent(
         reasoning_effort,
         allowed_tools,
         subagent_type,
+        permission,
     })
 }
 
@@ -1516,6 +1577,7 @@ fn resolve_mentions(input: &str, agents: &[commands::AgentSummary]) -> String {
                         subagent_type: None,
                         tools: None,
                         skills: None,
+                        permission: None,
                     };
                     let mut expansion = format!("\n---\nAgent: {}\n{}\n---\n", mention, content);
                     expansion.push_str(&agent_invocation_hint(&mention, &dummy));
@@ -1981,7 +2043,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
         .ok_or_else(|| {
             format!(
-                "unsupported permission mode '{value}'. Use read-only, workspace-access, or danger-full-access."
+                "unsupported permission mode '{value}'. Use read-only, workspace-access, yolo, or danger-full-access."
             )
         })
         .and_then(permission_mode_from_label)
@@ -1991,6 +2053,7 @@ fn permission_mode_from_label(mode: &str) -> Result<PermissionMode, String> {
     match mode {
         "read-only" => Ok(PermissionMode::ReadOnly),
         "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+        "yolo" => Ok(PermissionMode::Yolo),
         "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
         other => Err(format!("unsupported permission mode label: {other}")),
     }
@@ -2000,6 +2063,7 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
     match mode {
         ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
         ResolvedPermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
+        ResolvedPermissionMode::Yolo => PermissionMode::Yolo,
         ResolvedPermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
     }
 }
@@ -3370,6 +3434,11 @@ fn format_permissions_report(mode: &str) -> String {
             mode == "workspace-write",
         ),
         (
+            "yolo",
+            "Workspace writes + external read-only; others ask",
+            mode == "yolo",
+        ),
+        (
             "danger-full-access",
             "Unrestricted tool access",
             mode == "danger-full-access",
@@ -4127,6 +4196,7 @@ fn run_repl(
                         "mode": mentioned.mode,
                         "reasoning_effort": mentioned.reasoning_effort,
                         "allowed_tools": mentioned.allowed_tools,
+                        "permission": mentioned.permission,
                     })
                     .to_string();
                     editor.push_history(input);
@@ -5592,7 +5662,7 @@ impl LiveCli {
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
             format!(
-                "unsupported permission mode '{mode}'. Use read-only, workspace-access, or danger-full-access."
+                "unsupported permission mode '{mode}'. Use read-only, workspace-access, yolo, or danger-full-access."
             )
         })?;
 
@@ -5604,12 +5674,28 @@ impl LiveCli {
         let previous = self.permission_mode.as_str().to_string();
         let session = self.runtime.session().clone();
         self.permission_mode = permission_mode_from_label(normalized)?;
-        // Sync BoundaryPolicy with DangerFullAccess (yolo mode):
+        // Register the active permission mode so sub-agents spawned during
+        // the session inherit it (permission passthrough).
+        tools::set_active_permission_mode(self.permission_mode);
+        // Sync BoundaryPolicy with the active mode:
         //   danger-full-access → Allow (no boundary prompts)
+        //   yolo               → ExternalReadOnly (external reads silent, writes prompt)
         //   others             → Prompt (ask outside workspace)
         if normalized == "danger-full-access" {
             tools::set_active_workspace_policy(runtime::boundary::BoundaryPolicy::Allow);
-        } else if previous == "danger-full-access" {
+        } else if normalized == "yolo" {
+            let is_tty = io::stdout().is_terminal() && io::stdin().is_terminal();
+            let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+            if is_tty {
+                std::thread::spawn(move || permission_prompt::run_ui_thread(ui_rx));
+            }
+            let channel_prompter = permission_prompt::ChannelPrompter::new(ui_tx, is_tty);
+            tools::set_active_workspace_policy(runtime::boundary::BoundaryPolicy::ExternalReadOnly {
+                prompter: Arc::new(channel_prompter),
+                session_approved: Arc::new(Mutex::new(BTreeSet::new())),
+                user_typed: Arc::new(Mutex::new(BTreeSet::new())),
+            });
+        } else if previous == "danger-full-access" || previous == "yolo" {
             let is_tty = io::stdout().is_terminal() && io::stdin().is_terminal();
             let (ui_tx, ui_rx) = std::sync::mpsc::channel();
             if is_tty {
@@ -6968,6 +7054,7 @@ fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
         "read-only" => Some("read-only"),
         "workspace-write" | "workspace-access" => Some("workspace-write"),
+        "yolo" | "external-readonly" => Some("yolo"),
         "danger-full-access" => Some("danger-full-access"),
         _ => None,
     }
@@ -9191,6 +9278,7 @@ fn slash_command_completion_candidates_with_sessions(
         //   - SlashCommand::Permissions     – dispatch entry point
         // "/permissions read-only",
         "/permissions workspace-access",
+        "/permissions yolo",
         "/permissions danger-full-access",
         "/plugin list",
         "/plugin install ",
@@ -10142,7 +10230,11 @@ impl CliToolExecutor {
     /// Check workspace boundary for the given path.
     /// Returns Ok(()) if inside workspace or policy allows.
     /// Returns Err(ToolError) if blocked.
-    fn check_boundary(&self, path: &str) -> Result<(), ToolError> {
+    fn check_boundary(
+        &self,
+        path: &str,
+        operation: runtime::boundary::BoundaryOperation,
+    ) -> Result<(), ToolError> {
         let policy = tools::active_workspace_policy();
         let path_buf = std::path::PathBuf::from(path);
         let canonical_path = runtime::boundary::canonicalize_maybe_missing(&path_buf);
@@ -10155,23 +10247,14 @@ impl CliToolExecutor {
             return Ok(());
         }
 
-        match policy {
-            runtime::boundary::BoundaryPolicy::Block => Err(ToolError::new(format!(
-                "path {} escapes workspace boundary {}",
-                canonical_path.display(),
-                canonical_root.display(),
-            ))),
-            runtime::boundary::BoundaryPolicy::Allow => Ok(()),
-            runtime::boundary::BoundaryPolicy::Prompt { prompter, .. } => {
-                match prompter.ask(&canonical_path, &canonical_root) {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(ToolError::new(format!(
-                        "user denied access to {} (workspace {}): {e}",
-                        canonical_path.display(),
-                        canonical_root.display(),
-                    ))),
-                }
-            }
+        match policy.enforce_outside(
+            &canonical_path,
+            &canonical_root,
+            operation,
+        ) {
+            runtime::boundary::PolicyOutcome::Proceed
+            | runtime::boundary::PolicyOutcome::Approved { .. } => Ok(()),
+            runtime::boundary::PolicyOutcome::Denied(msg) => Err(ToolError::new(msg)),
         }
     }
 
@@ -10363,20 +10446,34 @@ impl ToolExecutor for CliToolExecutor {
 
         // Workspace boundary check for file-related tools
         match tool_name {
-            "read_file" | "new_file" | "edit_file"
-            | "Read" | "Write" | "Edit"
+            "read_file" | "Read"
             | "glob_search" | "grep_search"
             | "Glob" | "Grep" => {
                 let path = extract_tool_path(&value);
                 if !path.is_empty() {
-                    self.check_boundary(&path)?;
+                    self.check_boundary(
+                        &path,
+                        runtime::boundary::BoundaryOperation::Read,
+                    )?;
+                }
+            }
+            "new_file" | "edit_file" | "Write" | "Edit" => {
+                let path = extract_tool_path(&value);
+                if !path.is_empty() {
+                    self.check_boundary(
+                        &path,
+                        runtime::boundary::BoundaryOperation::Write,
+                    )?;
                 }
             }
             "bash" | "Bash" => {
                 if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
                     for path in extract_absolute_paths(command) {
                         if let Some(p) = path.to_str() {
-                            self.check_boundary(p)?;
+                            self.check_boundary(
+                                p,
+                                runtime::boundary::BoundaryOperation::Write,
+                            )?;
                         }
                     }
                 }
@@ -10527,7 +10624,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --permission-mode MODE     Set read-only, workspace-access, or danger-full-access"
+        "  --permission-mode MODE     Set read-only, workspace-access, yolo, or danger-full-access"
     )?;
     writeln!(
         out,
@@ -10536,7 +10633,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --workspace-policy MODE    How to handle paths outside the workspace: \
-         strict (deny), prompt (ask), allow (silent)"
+         strict (deny), prompt (ask), external-readonly (read-only external), allow (silent)"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
@@ -11360,6 +11457,51 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn workspace_policy_allow_promotes_mode_to_danger_full_access() {
+        // `--workspace-policy allow` means full access: the boundary policy
+        // allows everything AND the permission mode is promoted to
+        // danger-full-access so sub-agents inherit full access too.
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "workspace-write");
+        let args = vec![
+            "--workspace-policy".to_string(),
+            "allow".to_string(),
+            "status".to_string(),
+        ];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        match parsed {
+            CliAction::Status { permission_mode, .. } => {
+                assert_eq!(permission_mode, PermissionMode::DangerFullAccess);
+            }
+            other => panic!("expected CliAction::Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_policy_yolo_promotes_mode_to_yolo() {
+        // `--workspace-policy external-readonly` (alias yolo) promotes the
+        // permission mode to yolo so sub-agents inherit the same regime.
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "workspace-write");
+        let args = vec![
+            "--workspace-policy".to_string(),
+            "external-readonly".to_string(),
+            "status".to_string(),
+        ];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        match parsed {
+            CliAction::Status { permission_mode, .. } => {
+                assert_eq!(permission_mode, PermissionMode::Yolo);
+            }
+            other => panic!("expected CliAction::Status, got {other:?}"),
+        }
     }
 
     #[test]
@@ -12568,9 +12710,36 @@ mod tests {
     }
 
     #[test]
-    fn detect_mentioned_agent_falls_back_to_mention_name_when_frontmatter_name_differs_from_filename() {
+    fn detect_mentioned_agent_carries_permission_block_without_name() {
+        // architect.md-style file: no `name:`, so the strict frontmatter parse
+        // fails — but the `permission:` deny directives must still be honored
+        // (regression for the audit finding that the whole file was treated as
+        // prompt text and the denies were inert).
         let _guard = env_lock();
         let root = temp_dir();
+        let agents_dir = root.join(".claw").join("agents");
+        fs::create_dir_all(&agents_dir).expect("agents dir should exist");
+        fs::write(
+            agents_dir.join("architect.md"),
+            "---\ndescription: architect\nmode: subagent\npermission:\n  read: allow\n  write: deny\n  edit: deny\n  bash: deny\n  webfetch: deny\n---\n\nYou are the architect.\n",
+        )
+        .expect("agent file should write");
+        with_current_dir(&root, || {
+            let mentioned: MentionedAgent = detect_mentioned_agent("@architect plan a feature", &[])
+                .expect("mention should resolve to architect");
+            assert_eq!(mentioned.name, "architect");
+            let permission = mentioned.permission.expect("permission block parsed");
+            assert_eq!(permission.get("write").map(String::as_str), Some("deny"));
+            assert_eq!(permission.get("edit").map(String::as_str), Some("deny"));
+            assert_eq!(permission.get("bash").map(String::as_str), Some("deny"));
+            assert_eq!(permission.get("read").map(String::as_str), Some("allow"));
+        });
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn detect_mentioned_agent_falls_back_to_mention_name_when_frontmatter_name_differs_from_filename() {
+        let _guard = env_lock();        let root = temp_dir();
         let agents_dir = root.join(".claw").join("agents");
         fs::create_dir_all(&agents_dir).expect("agents dir should exist");
         // Frontmatter declares a display name that differs from the filename
@@ -12592,6 +12761,7 @@ mod tests {
             subagent_type: None,
             tools: None,
             skills: None,
+            permission: None,
             source: commands::DefinitionSource::Plugin,
             shadowed_by: None,
             plugin: Some("demo".to_string()),
@@ -12621,6 +12791,7 @@ mod tests {
             subagent_type: None,
             tools: None,
             skills: None,
+            permission: None,
             source: commands::DefinitionSource::Plugin,
             shadowed_by: None,
             plugin: Some("demo".to_string()),
@@ -13001,7 +13172,7 @@ mod tests {
         // read-only is not shown in help — it is consumed internally by
         // the sub-agent system so sub-agents cannot execute write tools.
         // See also the tab-completion exclusion below.
-        assert!(help.contains("/permissions [workspace-access|danger-full-access]"));
+        assert!(help.contains("/permissions [workspace-access|yolo|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
@@ -13035,6 +13206,7 @@ mod tests {
 
         assert!(completions.contains(&"/model claude-sonnet-4-6".to_string()));
         assert!(completions.contains(&"/permissions workspace-access".to_string()));
+        assert!(completions.contains(&"/permissions yolo".to_string()));
         assert!(completions.contains(&"/session list".to_string()));
         assert!(completions.contains(&"/session switch session-current".to_string()));
         assert!(completions.contains(&"/resume session-old".to_string()));
@@ -13542,6 +13714,11 @@ UU conflicted.rs",
         assert_eq!(
             normalize_permission_mode("workspace-write"),
             Some("workspace-write")
+        );
+        assert_eq!(normalize_permission_mode("yolo"), Some("yolo"));
+        assert_eq!(
+            normalize_permission_mode("external-readonly"),
+            Some("yolo")
         );
         assert_eq!(
             normalize_permission_mode("danger-full-access"),

@@ -5,10 +5,16 @@ use serde_json::Value;
 use crate::config::RuntimePermissionRuleConfig;
 
 /// Permission level assigned to a tool invocation or runtime session.
+///
+/// The enum ordering is significant: `authorize_impl` grants access when
+/// `current_mode >= required_mode`. `Yolo` sits between `WorkspaceWrite`
+/// and `DangerFullAccess`, so it permits workspace writes but still
+/// requires approval to escalate to danger-full-access tools (e.g. bash).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
+    Yolo,
     DangerFullAccess,
     Prompt,
     Allow,
@@ -20,6 +26,7 @@ impl PermissionMode {
         match self {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
+            Self::Yolo => "yolo",
             Self::DangerFullAccess => "danger-full-access",
             Self::Prompt => "prompt",
             Self::Allow => "allow",
@@ -210,6 +217,48 @@ impl PermissionPolicy {
         self.active_mode
     }
 
+    /// Deny every invocation of `tool_name` unconditionally. Adds a rule with
+    /// an `Any` matcher (no subject extraction), so the directive covers all
+    /// inputs of the tool. Used to honor sub-agent `permission:` frontmatter
+    /// directives (e.g. `write: deny`), which must be effective even under
+    /// `DangerFullAccess` — deny rules are evaluated before the mode gate.
+    #[must_use]
+    pub fn with_deny_all(mut self, tool_name: impl Into<String>) -> Self {
+        let tool_name = tool_name.into();
+        self.deny_rules.push(PermissionRule {
+            raw: format!("{tool_name}()"),
+            tool_name,
+            matcher: PermissionRuleMatcher::Any,
+        });
+        self
+    }
+
+    /// Allow every invocation of `tool_name` unconditionally. Mirrors
+    /// [`Self::with_deny_all`] for the allow list.
+    #[must_use]
+    pub fn with_allow_all(mut self, tool_name: impl Into<String>) -> Self {
+        let tool_name = tool_name.into();
+        self.allow_rules.push(PermissionRule {
+            raw: format!("{tool_name}()"),
+            tool_name,
+            matcher: PermissionRuleMatcher::Any,
+        });
+        self
+    }
+
+    /// Require approval for every invocation of `tool_name`. Mirrors
+    /// [`Self::with_deny_all`] for the ask list.
+    #[must_use]
+    pub fn with_ask_all(mut self, tool_name: impl Into<String>) -> Self {
+        let tool_name = tool_name.into();
+        self.ask_rules.push(PermissionRule {
+            raw: format!("{tool_name}()"),
+            tool_name,
+            matcher: PermissionRuleMatcher::Any,
+        });
+        self
+    }
+
     #[must_use]
     pub fn required_mode_for(&self, tool_name: &str) -> PermissionMode {
         if let Some(&mode) = self.tool_requirements.get(tool_name) {
@@ -350,9 +399,23 @@ impl PermissionPolicy {
             return PermissionOutcome::Allow;
         }
 
+        // Yolo ("You Only Live Once") auto-approves ordinary in-workspace
+        // tool calls — including everyday bash commands — but keeps
+        // dangerous/sensitive commands at DangerFullAccess so they still ask.
+        // Mirrors the tools-crate `classify_bash_permission` heuristic (which
+        // the runtime cannot depend on) so authorization and the CLI
+        // enforcement path agree on which commands escalate.
+        let yolo_grants_bash = current_mode == PermissionMode::Yolo
+            && is_bash_tool(tool_name)
+            && required_mode == PermissionMode::DangerFullAccess
+            && !classify_bash_sensitive(input);
+
         if current_mode == PermissionMode::Prompt
-            || (current_mode == PermissionMode::WorkspaceWrite
-                && required_mode == PermissionMode::DangerFullAccess)
+            || (matches!(
+                current_mode,
+                PermissionMode::WorkspaceWrite | PermissionMode::Yolo
+            ) && required_mode == PermissionMode::DangerFullAccess
+                && !yolo_grants_bash)
         {
             let reason = Some(format!(
                 "tool '{tool_name}' requires approval to escalate from {} to {}",
@@ -367,6 +430,10 @@ impl PermissionPolicy {
                 reason,
                 prompter,
             );
+        }
+
+        if yolo_grants_bash {
+            return PermissionOutcome::Allow;
         }
 
         PermissionOutcome::Deny {
@@ -736,13 +803,185 @@ fn extract_permission_subject(input: &str, tool_name: &str) -> Option<String> {
     object.get(key).and_then(Value::as_str).map(|s| s.to_string())
 }
 
+/// `true` for the `bash`/`execute_command` family of tools. Used by yolo mode
+/// to apply command-aware authorization (ordinary commands auto-approve,
+/// dangerous/sensitive commands still ask).
+fn is_bash_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "bash" | "execute_command" | "shell"
+    )
+}
+
+/// Heuristic that classifies a bash command as *sensitive*: such commands
+/// stay at `DangerFullAccess` under yolo mode so they still require
+/// approval, mirroring the tools-crate `classify_bash_permission` /
+/// `has_dangerous_paths` checks (the runtime cannot depend on the tools
+/// crate, so the same classification is re-implemented here).
+///
+/// A command is sensitive when it:
+/// - references absolute / home-relative paths outside the workspace
+///   (e.g. `/etc/`, `~/.ssh/`, `.env`-adjacent absolute paths)
+/// - contains `..` traversal
+/// - embeds a network URL or `file://` (data exfiltration vectors)
+///
+/// Commands that are purely relative (e.g. `ls -la`, `git status`,
+/// `cargo test`) are treated as ordinary and auto-approved by yolo.
+fn classify_bash_sensitive(input: &str) -> bool {
+    let Some(command) = extract_permission_subject(input, "bash") else {
+        // Malformed or unparseable input: conservatively keep it sensitive.
+        return true;
+    };
+
+    // Destructive / privilege-escalating commands are always sensitive
+    // regardless of path, mirroring `bash_validation::check_destructive`.
+    if bash_command_is_destructive(&command) {
+        return true;
+    }
+
+    let mut token = String::new();
+    for ch in command.chars() {
+        if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+            if !token.is_empty() {
+                if bash_token_is_sensitive(&token) {
+                    return true;
+                }
+                token.clear();
+            }
+            continue;
+        }
+        token.push(ch);
+    }
+    if !token.is_empty() && bash_token_is_sensitive(&token) {
+        return true;
+    }
+    false
+}
+
+/// Detect destructive or privilege-escalating commands that must never be
+/// auto-approved, even under yolo. Mirrors the patterns in
+/// `bash_validation::check_destructive` plus `sudo` (privilege escalation).
+fn bash_command_is_destructive(command: &str) -> bool {
+    const DESTRUCTIVE_SUBSTRINGS: &[&str] = &[
+        "rm -rf /",
+        "rm -rf ~",
+        "rm -rf *",
+        "rm -rf .",
+        "mkfs",
+        "dd if=",
+        "> /dev/sd",
+        "chmod -R 777",
+        "chmod -R 000",
+        ":(){ :|:& };:",
+        "shred",
+        "wipefs",
+    ];
+    if DESTRUCTIVE_SUBSTRINGS
+        .iter()
+        .any(|pattern| command.contains(pattern))
+    {
+        return true;
+    }
+    // `sudo` escalates privileges; keep it at DangerFullAccess so it asks.
+    if command
+        .split_whitespace()
+        .next()
+        .is_some_and(|first| first == "sudo")
+    {
+        return true;
+    }
+    false
+}
+
+fn bash_token_is_sensitive(token: &str) -> bool {
+    // Strip surrounding quotes so `cat "C:\Users\foo\bar.txt"` is
+    // recognised as an absolute path.
+    let stripped = token
+        .trim_start_matches(['"', '\''])
+        .trim_end_matches(['"', '\'']);
+
+    // Options / flags are never sensitive on their own.
+    if stripped.starts_with('-') {
+        return false;
+    }
+
+    // `file://` and network URLs bypass normal path checks and enable
+    // data exfiltration.
+    if stripped.starts_with("file://")
+        || stripped.starts_with("http://")
+        || stripped.starts_with("https://")
+        || stripped.starts_with("ftp://")
+        || stripped.starts_with("ftp.")
+    {
+        return true;
+    }
+
+    // Directory traversal.
+    if stripped.contains("../") || stripped.contains("..\\") {
+        return true;
+    }
+
+    // Absolute POSIX path or `~/...` home-relative path. Sensitive unless
+    // it is a known-safe shell command word (e.g. `/bin/ls`, `/usr/bin/cat`).
+    if stripped.starts_with('/') || stripped.starts_with("~/") {
+        if is_safe_absolute_bin(stripped) {
+            return false;
+        }
+        return true;
+    }
+
+    // Windows drive-letter absolute path, e.g. `C:\Users\...`.
+    let bytes = stripped.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+
+    // Home-relative forms using an explicit env var.
+    if stripped.contains("$HOME") || stripped.contains("$USERPROFILE") {
+        return true;
+    }
+
+    false
+}
+
+/// A `/usr/bin/ls`-style path points at a trusted system binary, not at a
+/// file the command is reading/writing, so it is not sensitive.
+fn is_safe_absolute_bin(token: &str) -> bool {
+    const SAFE_BIN_PREFIXES: &[&str] = &[
+        "/bin/",
+        "/usr/bin/",
+        "/usr/local/bin/",
+        "/usr/sbin/",
+        "/sbin/",
+        "/opt/",
+    ];
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    let expanded = token.replace('~', &home);
+    SAFE_BIN_PREFIXES.iter().any(|prefix| {
+        if let Some(rest) = expanded.strip_prefix(prefix) {
+            // The remainder must be a plain binary name, not a path into
+            // a sensitive location.
+            !rest.contains('/')
+        } else {
+            false
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride,
-        PermissionPolicy, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
-        PermissionRule, PermissionRuleMatcher, RuleList, extract_permission_subject,
-        find_first_unescaped, find_last_unescaped, is_broad_matcher_warning,
+        classify_bash_sensitive, is_bash_tool, PermissionContext, PermissionMode,
+        PermissionOutcome, PermissionOverride, PermissionPolicy, PermissionPromptDecision,
+        PermissionPrompter, PermissionRequest, PermissionRule, PermissionRuleMatcher, RuleList,
+        extract_permission_subject, find_first_unescaped, find_last_unescaped,
+        is_broad_matcher_warning,
     };
     use crate::config::RuntimePermissionRuleConfig;
 
@@ -1424,6 +1663,201 @@ mod tests {
             .with_permission_rules(&rules);
         // Build must succeed.
         let _ = policy;
+    }
+
+    // ── Phase 10: Whole-tool builders (sub-agent `permission:` directives) ──
+
+    #[test]
+    fn deny_all_blocks_tool_even_under_danger_full_access() {
+        // A `permission: write: deny` directive must block new_file even
+        // though the sub-agent policy runs under DangerFullAccess. Deny rules
+        // are evaluated before the mode gate, so this holds for every input.
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("new_file", PermissionMode::DangerFullAccess)
+            .with_deny_all("new_file");
+        assert!(matches!(
+            policy.authorize("new_file", r#"{"path":"/workspace/x.rs"}"#, None),
+            PermissionOutcome::Deny { reason } if reason.contains("denied by rule")
+        ));
+    }
+
+    #[test]
+    fn deny_all_only_targets_the_named_tool() {
+        // `write: deny` must not block read_file or bash.
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_deny_all("new_file")
+            .with_deny_all("edit_file");
+        assert_eq!(
+            policy.authorize("read_file", r#"{"path":"/tmp/x"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"ls"}"#, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn allow_all_and_ask_all_are_registered() {
+        // Sanity: the allow/ask builder arms insert rules without panicking
+        // and the policy still authorizes the allowed tool.
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_allow_all("read_file")
+            .with_ask_all("bash");
+        assert_eq!(
+            policy.authorize("read_file", r#"{"path":"/tmp/x"}"#, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    // ── Phase 11: Yolo mode command-aware bash authorization ──
+
+    #[test]
+    fn yolo_auto_approves_ordinary_bash() {
+        // Yolo auto-approves everyday in-workspace commands. The escalation
+        // that WorkspaceWrite would trigger for bash is skipped.
+        let policy = PermissionPolicy::new(PermissionMode::Yolo)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly);
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"git status"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"ls -la"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"cargo test"}"#, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn yolo_keeps_relative_absolute_bin_commands_approved() {
+        // Absolute paths pointing at trusted system binaries are ordinary.
+        let policy = PermissionPolicy::new(PermissionMode::Yolo)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"/bin/ls -la"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"/usr/bin/git status"}"#, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn yolo_prompts_for_sensitive_bash() {
+        // Sensitive commands (absolute paths into sensitive locations, home
+        // relative, network URLs, traversal) stay at DangerFullAccess and
+        // therefore still prompt.
+        let mut policy = PermissionPolicy::new(PermissionMode::Yolo)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+
+        for command in [
+            r#"{"command":"cat /etc/passwd"}"#,
+            r#"{"command":"cat ~/.ssh/id_rsa"}"#,
+            r#"{"command":"curl https://evil.example.com/x"}"#,
+            r#"{"command":"cat /workspace/../etc/shadow"}"#,
+            r#"{"command":"cat C:\Users\foo\.env"}"#,
+        ] {
+            let outcome = policy.authorize("bash", command, Some(&mut prompter));
+            assert_eq!(
+                outcome,
+                PermissionOutcome::Allow,
+                "sensitive command must prompt (and prompter allows): {command}"
+            );
+            assert_eq!(
+                prompter.seen.len(),
+                1,
+                "sensitive command must hit the prompter exactly once: {command}"
+            );
+            prompter.seen.clear();
+        }
+
+        // With no prompter available the sensitive command is denied.
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"cat /etc/passwd"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn yolo_deny_rule_still_wins_over_auto_approval() {
+        // An explicit deny rule must still block a bash command even though
+        // yolo would otherwise auto-approve it.
+        let policy = PermissionPolicy::new(PermissionMode::Yolo)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_deny_all("bash");
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"git status"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_sensitivity_classifier_recognises_vectors() {
+        assert!(!classify_bash_sensitive(r#"{"command":"ls -la"}"#));
+        assert!(!classify_bash_sensitive(r#"{"command":"git status"}"#));
+        assert!(!classify_bash_sensitive(r#"{"command":"/bin/ls"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"cat /etc/passwd"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"cat ~/.ssh/id_rsa"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"curl https://x.com"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"cat ../secret.txt"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"cat C:\Users\a\.env"}"#));
+        // Unparseable input is conservatively sensitive.
+        assert!(classify_bash_sensitive("not json"));
+    }
+
+    #[test]
+    fn bash_sensitivity_flags_destructive_and_sudo() {
+        assert!(classify_bash_sensitive(r#"{"command":"rm -rf /tmp/x"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"sudo rm -rf ."}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"mkfs.ext4 /dev/sdb"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"shred secret.txt"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"sudo apt install x"}"#));
+        assert!(classify_bash_sensitive(r#"{"command":"dd if=/dev/zero of=/dev/sda"}"#));
+        // Plain destructive relative commands still auto-approve? No —
+        // destructive is destructive regardless of path.
+        assert!(classify_bash_sensitive(r#"{"command":"rm -rf ."}"#));
+    }
+
+    #[test]
+    fn yolo_prompts_for_destructive_bash() {
+        // `rm -rf`, `sudo`, etc. stay at DangerFullAccess and therefore
+        // still prompt even though they target relative paths.
+        let mut policy = PermissionPolicy::new(PermissionMode::Yolo)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+        for command in [
+            r#"{"command":"rm -rf /tmp/x"}"#,
+            r#"{"command":"sudo ls /etc"}"#,
+        ] {
+            assert_eq!(
+                policy.authorize("bash", command, Some(&mut prompter)),
+                PermissionOutcome::Allow
+            );
+            assert_eq!(prompter.seen.len(), 1, "must prompt: {command}");
+            prompter.seen.clear();
+        }
+    }
+
+    #[test]
+    fn is_bash_tool_recognises_aliases() {
+        assert!(is_bash_tool("bash"));
+        assert!(is_bash_tool("execute_command"));
+        assert!(is_bash_tool("Shell"));
+        assert!(!is_bash_tool("read_file"));
+        assert!(!is_bash_tool("new_file"));
     }
 
     #[test]

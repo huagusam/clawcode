@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -127,6 +127,12 @@ pub struct AgentOutput {
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// `permission:` directives from the agent definition's frontmatter,
+    /// as `tool-category → allow|deny|ask`. When present, the spawned
+    /// sub-agent's `PermissionPolicy` is built with these as explicit rules
+    /// (deny rules are effective even under `DangerFullAccess`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +152,12 @@ pub struct AgentJob {
     pub system_prompt: Vec<String>,
     pub allowed_tools: BTreeSet<String>,
     pub reasoning_effort: Option<String>,
+    pub permission: Option<BTreeMap<String, String>>,
+    /// Permission mode inherited from the parent session (permission
+    /// passthrough). The sub-agent's `PermissionPolicy` is built with
+    /// this mode as its base instead of always using
+    /// `DangerFullAccess`.
+    pub permission_mode: runtime::PermissionMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,4 +189,10 @@ pub struct AgentInput {
     /// provider default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Optional `permission:` directives from the agent file frontmatter
+    /// (`tool-category → allow|deny|ask`). Honored as explicit rules on the
+    /// spawned sub-agent's `PermissionPolicy`. Not advertised in the tool
+    /// schema: the model must not be able to grant itself permissions.
+    #[serde(default)]
+    pub permission: Option<BTreeMap<String, String>>,
 }

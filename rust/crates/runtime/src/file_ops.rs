@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::boundary::{
-    canonicalize_maybe_missing, classify_boundary, BoundaryCheck, BoundaryPolicy, PolicyOutcome,
+    canonicalize_maybe_missing, classify_boundary, BoundaryCheck, BoundaryOperation,
+    BoundaryPolicy, PolicyOutcome,
 };
 
 /// Maximum file size that can be read (10 MB).
@@ -945,7 +946,7 @@ pub fn read_file_with_policy(
     let canonical_path = canonicalize_maybe_missing(&absolute_path);
     let check = classify_boundary(&canonical_path, &canonical_root);
     if matches!(check, BoundaryCheck::OutOfWorkspace { .. }) {
-        match policy.enforce_outside(&canonical_path, &canonical_root) {
+        match policy.enforce_outside(&canonical_path, &canonical_root, BoundaryOperation::Read) {
             PolicyOutcome::Proceed | PolicyOutcome::Approved { .. } => {}
             PolicyOutcome::Denied(msg) => {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
@@ -986,7 +987,7 @@ pub fn new_file_with_policy(
     let canonical_path = canonicalize_maybe_missing(&absolute_path);
     let check = classify_boundary(&canonical_path, &canonical_root);
     if matches!(check, BoundaryCheck::OutOfWorkspace { .. }) {
-        match policy.enforce_outside(&canonical_path, &canonical_root) {
+        match policy.enforce_outside(&canonical_path, &canonical_root, BoundaryOperation::Write) {
             PolicyOutcome::Proceed | PolicyOutcome::Approved { .. } => {}
             PolicyOutcome::Denied(msg) => {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
@@ -1019,7 +1020,7 @@ pub fn edit_file_with_policy(
     let canonical_path = canonicalize_maybe_missing(&absolute_path);
     let check = classify_boundary(&canonical_path, &canonical_root);
     if matches!(check, BoundaryCheck::OutOfWorkspace { .. }) {
-        match policy.enforce_outside(&canonical_path, &canonical_root) {
+        match policy.enforce_outside(&canonical_path, &canonical_root, BoundaryOperation::Write) {
             PolicyOutcome::Proceed | PolicyOutcome::Approved { .. } => {}
             PolicyOutcome::Denied(msg) => {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
@@ -1057,7 +1058,7 @@ pub fn glob_search_with_policy(
                 return true;
             }
             matches!(
-                policy.enforce_outside(Path::new(f), &canonical_root),
+                policy.enforce_outside(Path::new(f), &canonical_root, BoundaryOperation::Read),
                 PolicyOutcome::Proceed | PolicyOutcome::Approved { .. }
             )
         })
@@ -1094,7 +1095,7 @@ pub fn grep_search_with_policy(
         classify_boundary(&base_path, &canonical_root),
         BoundaryCheck::OutOfWorkspace { .. }
     ) && matches!(
-        policy.enforce_outside(&base_path, &canonical_root),
+        policy.enforce_outside(&base_path, &canonical_root, BoundaryOperation::Read),
         PolicyOutcome::Denied(_)
     ) {
         return Err(io::Error::new(

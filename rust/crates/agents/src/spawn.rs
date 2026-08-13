@@ -23,6 +23,22 @@ pub struct AgentHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TryAgain;
 
+/// Reap the worker and drop its progress entry whenever the handle is dropped,
+/// not just on the explicit `join` path. Without this, a `try_join`-only
+/// consumer (the production `wait_for_agent`) leaks the progress entry for the
+/// process lifetime, and a handle dropped after a timeout detaches the worker
+/// thread instead of reaping it. The worker's provider calls are time-bounded
+/// (api crate), so `join` always terminates.
+impl Drop for AgentHandle {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
+        remove_progress_entry(&self.progress, &self.agent_id);
+    }
+}
+
 impl AgentHandle {
     pub fn agent_id(&self) -> &str {
         &self.agent_id
@@ -113,8 +129,8 @@ impl AgentHandle {
     }
 
     #[cfg(feature = "test-utils")]
-    pub fn join_with_timeout(self, timeout: Duration) -> Result<String, String> {
-        let rx = match self.rx {
+    pub fn join_with_timeout(mut self, timeout: Duration) -> Result<String, String> {
+        let rx = match self.rx.take() {
             Some(rx) => rx,
             None => return Ok(String::new()),
         };
@@ -126,7 +142,7 @@ impl AgentHandle {
                 Err("agent disconnected".to_string())
             }
         };
-        let _ = self.thread_handle.map(|h| h.join());
+        let _ = self.thread_handle.take().map(|h| h.join());
         result
     }
 }
@@ -269,7 +285,10 @@ fn run_agent_job_sync_with_progress(job: &AgentJobWithProgress) -> Result<String
     let summary = runtime
         .run_turn(job.job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
-    Ok(final_assistant_text(&summary))
+    match final_assistant_text(&summary) {
+        Some(text) => Ok(text),
+        None => Err("agent returned no text".to_string()),
+    }
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -282,7 +301,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
+fn final_assistant_text(summary: &runtime::TurnSummary) -> Option<String> {
     // Walk messages newest-first so a thinking-only final turn does not
     // silently erase the agent's real answer from an earlier message.
     //
@@ -315,7 +334,7 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
             .collect::<Vec<_>>()
             .join("\n\n");
         if !text.is_empty() {
-            return text;
+            return Some(text);
         }
     }
 
@@ -326,14 +345,17 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
             if let runtime::ContentBlock::Thinking { thinking, .. } = block {
                 let trimmed = thinking.trim();
                 if !trimmed.is_empty() {
-                    return trimmed.to_string();
+                    return Some(trimmed.to_string());
                 }
             }
         }
     }
 
-    // Truly nothing to report — never return an empty tool result.
-    "(agent returned no text)".to_string()
+    // Truly nothing to report. `None` propagates as an error to the parent so
+    // a sub-agent that produced no output is never mistaken for a successful
+    // delegation (the old code returned a `"(agent returned no text)"` marker
+    // with `is_error=false`, silently swallowing the failure).
+    None
 }
 
 #[cfg(test)]
@@ -391,7 +413,7 @@ mod tests {
     #[test]
     fn returns_text_from_last_message() {
         let summary = summary_with(vec![msg(vec![text("hello")])]);
-        assert_eq!(final_assistant_text(&summary), "hello");
+        assert_eq!(final_assistant_text(&summary), Some("hello".to_string()));
     }
 
     #[test]
@@ -400,19 +422,25 @@ mod tests {
             msg(vec![text("earlier result")]),
             msg(vec![thinking("thinking only")]),
         ]);
-        assert_eq!(final_assistant_text(&summary), "earlier result");
+        assert_eq!(
+            final_assistant_text(&summary),
+            Some("earlier result".to_string())
+        );
     }
 
     #[test]
     fn returns_thinking_text_when_no_text_blocks_exist() {
         let summary = summary_with(vec![msg(vec![thinking("deep reasoning")])]);
-        assert_eq!(final_assistant_text(&summary), "deep reasoning");
+        assert_eq!(
+            final_assistant_text(&summary),
+            Some("deep reasoning".to_string())
+        );
     }
 
     #[test]
-    fn returns_marker_when_no_blocks_at_all() {
+    fn returns_none_when_no_blocks_at_all() {
         let summary = summary_with(vec![]);
-        assert!(!final_assistant_text(&summary).is_empty());
+        assert_eq!(final_assistant_text(&summary), None);
     }
 
     #[test]
@@ -421,7 +449,10 @@ mod tests {
             msg(vec![text("   ")]),
             msg(vec![text("real answer")]),
         ]);
-        assert_eq!(final_assistant_text(&summary), "real answer");
+        assert_eq!(
+            final_assistant_text(&summary),
+            Some("real answer".to_string())
+        );
     }
 
     #[test]
@@ -430,7 +461,10 @@ mod tests {
             msg(vec![text("Let me check the file first"), tool_use()]),
             msg(vec![thinking("The real answer is 42")]),
         ]);
-        assert_eq!(final_assistant_text(&summary), "The real answer is 42");
+        assert_eq!(
+            final_assistant_text(&summary),
+            Some("The real answer is 42".to_string())
+        );
     }
 
     #[test]
@@ -440,7 +474,10 @@ mod tests {
             msg(vec![text("Let me verify"), tool_use()]),
             msg(vec![thinking("final reasoning only")]),
         ]);
-        assert_eq!(final_assistant_text(&summary), "actual result");
+        assert_eq!(
+            final_assistant_text(&summary),
+            Some("actual result".to_string())
+        );
     }
 
     #[test]
@@ -451,7 +488,7 @@ mod tests {
         ]);
         assert_eq!(
             final_assistant_text(&summary),
-            "the answer is deep reasoning"
+            Some("the answer is deep reasoning".to_string())
         );
     }
 }
