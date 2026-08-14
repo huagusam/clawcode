@@ -12,6 +12,7 @@ use crate::conversation::merge_tool_result_messages;
 use crate::image_cache::ImageCache;
 use crate::image_store::ImageStore;
 use crate::json::{JsonError, JsonValue};
+use crate::transcript::TranscriptWriter;
 use crate::usage::TokenUsage;
 
 const SESSION_VERSION: u32 = 1;
@@ -161,6 +162,10 @@ pub struct Session {
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
     persistence: Option<SessionPersistence>,
+    /// Best-effort Markdown transcript mirror of the terminal-visible
+    /// conversation, appended on every `push_message`. Never serialized and
+    /// never allowed to fail a session write.
+    transcript: Option<TranscriptWriter>,
     pub image_cache: ImageCache,
 }
 
@@ -228,6 +233,7 @@ impl Session {
             last_health_check_ms: None,
             model: None,
             persistence: None,
+            transcript: None,
             image_cache: ImageCache::new(),
         }
     }
@@ -235,6 +241,15 @@ impl Session {
     #[must_use]
     pub fn with_persistence_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.persistence = Some(SessionPersistence { path: path.into() });
+        self
+    }
+
+    /// Attach a Markdown transcript mirror. `None` disables transcript
+    /// writing (the default). The writer is best-effort: write failures are
+    /// swallowed inside `push_message`.
+    #[must_use]
+    pub fn with_transcript(mut self, path: Option<PathBuf>) -> Self {
+        self.transcript = path.map(TranscriptWriter::new);
         self
     }
 
@@ -297,6 +312,12 @@ impl Session {
             self.messages.pop();
             return Err(error);
         }
+        // Best-effort Markdown transcript mirror (terminal content for AI
+        // retrieval). Never propagated: a transcript failure must not fail,
+        // roll back, or slow down the live session.
+        if let (Some(writer), Some(message_ref)) = (&self.transcript, self.messages.last()) {
+            writer.append_message_best_effort(&self.session_id, message_ref);
+        }
         Ok(())
     }
 
@@ -350,6 +371,7 @@ impl Session {
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
             persistence: None,
+            transcript: self.transcript.clone(),
             image_cache: ImageCache::new(),
         }
     }
@@ -475,6 +497,7 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            transcript: None,
             image_cache: ImageCache::new(),
         })
     }
@@ -577,6 +600,7 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            transcript: None,
             image_cache: ImageCache::new(),
         })
     }

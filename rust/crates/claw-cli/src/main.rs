@@ -4909,8 +4909,11 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let created_at_ms = session_state.created_at_ms;
         let runtime = build_runtime(
-            session_state.with_persistence_path(session.path.clone()),
+            session_state
+                .with_persistence_path(session.path.clone())
+                .with_transcript(transcript_path(created_at_ms)),
             &session.id,
             model.clone(),
             system_prompt.clone(),
@@ -5738,8 +5741,11 @@ impl LiveCli {
         let previous_session = self.session.clone();
         let session_state = new_cli_session()?;
         self.session = create_managed_session_handle(&session_state.session_id)?;
+        let created_at_ms = session_state.created_at_ms;
         let runtime = build_runtime(
-            session_state.with_persistence_path(self.session.path.clone()),
+            session_state
+                .with_persistence_path(self.session.path.clone())
+                .with_transcript(transcript_path(created_at_ms)),
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
@@ -5779,8 +5785,9 @@ impl LiveCli {
         let (handle, session) = load_session_reference(&session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
+        let created_at_ms = session.created_at_ms;
         let runtime = build_runtime(
-            session,
+            session.with_transcript(transcript_path(created_at_ms)),
             &handle.id,
             self.model.clone(),
             self.system_prompt.clone(),
@@ -5979,7 +5986,10 @@ impl LiveCli {
                     .fork
                     .as_ref()
                     .and_then(|fork| fork.branch_name.clone());
-                let forked = forked.with_persistence_path(handle.path.clone());
+                let created_at_ms = forked.created_at_ms;
+                let forked = forked
+                    .with_persistence_path(handle.path.clone())
+                    .with_transcript(transcript_path(created_at_ms));
                 let message_count = forked.messages.len();
                 forked.save_to_path(&handle.path)?;
                 let runtime = build_runtime(
@@ -6171,6 +6181,14 @@ fn create_managed_session_handle(
         id: handle.id,
         path: handle.path,
     })
+}
+
+/// Per-session Markdown transcript path named after the session start hour
+/// (`<config_home>/transcripts/<YYYY-MM-DD>-<HH>.md`). The misnamed
+/// argument honours the old name; pass the owning session's `created_at_ms`.
+/// The transcript writer is best-effort and disabled silently on failure.
+fn transcript_path(created_at_ms: u64) -> Option<PathBuf> {
+    runtime::transcript_path_for(created_at_ms).ok()
 }
 
 fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
@@ -7615,12 +7633,26 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    let mut sections = load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
-    )?)
+    )?;
+    // Point the model at the transcript archive dir so earlier
+    // terminal-visible conversation (which compaction may have summarized
+    // away) is retrievable instead of guessed at. The archive dir is
+    // timestamp-independent, so no session is needed here.
+    let archive_dir = default_config_home().join("transcripts");
+    sections.push(format!(
+        "# Conversation history archive\n\
+         The full terminal-visible conversation history is archived in Markdown under `{}` \
+         (one file per hour, named from the session start hour). When you need details from \
+         earlier work that were compacted away, or the user refers to a past session, read those \
+         files with the Read tool.",
+        archive_dir.display()
+    ));
+    Ok(sections)
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {

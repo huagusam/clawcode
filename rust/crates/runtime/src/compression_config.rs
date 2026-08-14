@@ -38,7 +38,7 @@ impl Default for CompressionConfig {
             webfetch_ttl_secs: 30,
             compact_preserve_recent_messages: 4,
             compact_preserve_recent_tokens: 2000,
-            compact_max_estimated_tokens: 10_000,
+            compact_max_estimated_tokens: 50_000,
             compact_preserve_last_n_turns: 0,
             summary_max_chars: 1_200,
             summary_max_lines: 24,
@@ -57,7 +57,7 @@ impl CompressionConfig {
             webfetch_ttl_secs: read_env(CLAW_WEBFETCH_TTL_SECS).unwrap_or(30),
             compact_preserve_recent_messages: read_env(CLAW_COMPACT_PRESERVE_MSGS).unwrap_or(4),
             compact_preserve_recent_tokens: read_env(CLAW_COMPACT_PRESERVE_TOKENS).unwrap_or(2000),
-            compact_max_estimated_tokens: read_env(CLAW_COMPACT_MAX_TOKENS).unwrap_or(10_000),
+            compact_max_estimated_tokens: read_env(CLAW_COMPACT_MAX_TOKENS).unwrap_or(50_000),
             compact_preserve_last_n_turns: read_env(CLAW_COMPACT_PRESERVE_TURNS).unwrap_or(0),
             summary_max_chars: read_env(CLAW_SUMMARY_MAX_CHARS).unwrap_or(1_200),
             summary_max_lines: read_env(CLAW_SUMMARY_MAX_LINES).unwrap_or(24),
@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(config.webfetch_ttl_secs, 30);
         assert_eq!(config.compact_preserve_recent_messages, 4);
         assert_eq!(config.compact_preserve_recent_tokens, 2000);
-        assert_eq!(config.compact_max_estimated_tokens, 10_000);
+        assert_eq!(config.compact_max_estimated_tokens, 50_000);
         assert_eq!(config.compact_preserve_last_n_turns, 0);
         assert_eq!(config.summary_max_chars, 1_200);
         assert_eq!(config.summary_max_lines, 24);

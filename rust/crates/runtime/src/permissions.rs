@@ -1753,7 +1753,7 @@ mod tests {
         // Sensitive commands (absolute paths into sensitive locations, home
         // relative, network URLs, traversal) stay at DangerFullAccess and
         // therefore still prompt.
-        let mut policy = PermissionPolicy::new(PermissionMode::Yolo)
+        let policy = PermissionPolicy::new(PermissionMode::Yolo)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
         let mut prompter = RecordingPrompter {
             seen: Vec::new(),
@@ -1832,7 +1832,7 @@ mod tests {
     fn yolo_prompts_for_destructive_bash() {
         // `rm -rf`, `sudo`, etc. stay at DangerFullAccess and therefore
         // still prompt even though they target relative paths.
-        let mut policy = PermissionPolicy::new(PermissionMode::Yolo)
+        let policy = PermissionPolicy::new(PermissionMode::Yolo)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
         let mut prompter = RecordingPrompter {
             seen: Vec::new(),

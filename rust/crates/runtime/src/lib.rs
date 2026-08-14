@@ -53,6 +53,8 @@ pub mod team_cron_registry;
 pub mod text_only_models;
 pub mod thinking;
 pub mod tool_registry;
+mod transcript;
+pub use transcript::{transcript_path_for, TranscriptWriter};
 mod trust_resolver;
 mod usage;
 

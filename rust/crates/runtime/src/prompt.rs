@@ -296,15 +296,9 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
     }
-    if let Some(ref gc) = project_context.git_context {
-        if !gc.recent_commits.is_empty() {
-            lines.push(String::new());
-            lines.push("Recent commits (last 5):".to_string());
-            for c in &gc.recent_commits {
-                lines.push(format!("  {} {}", c.hash, c.subject));
-            }
-        }
-    }
+    // `GitContext::render()` below already emits branch + recent commits +
+    // staged files. Rendering `recent_commits` again here duplicated the same
+    // five commits into the system prompt on every turn.
     if let Some(git_context) = &project_context.git_context {
         let rendered = git_context.render();
         if !rendered.is_empty() {
@@ -689,7 +683,8 @@ mod tests {
         assert!(status.contains("## main"));
         assert!(status.contains("A  d.txt"));
 
-        assert!(rendered.contains("Recent commits (last 5):"));
+        assert!(rendered.contains("Git branch:"));
+        assert!(rendered.contains("Recent commits:"));
         assert!(rendered.contains("first commit"));
         assert!(rendered.contains("Git status snapshot:"));
         assert!(rendered.contains("## main"));
